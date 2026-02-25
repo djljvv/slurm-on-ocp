@@ -1,0 +1,29 @@
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+logs/
+
+# Local test files
+test-output/
+*.out
+
+# Secrets and keys (never commit!)
+*.key
+*.pem
+*.crt
+
+# Optional (uncomment if you use)
+# video/

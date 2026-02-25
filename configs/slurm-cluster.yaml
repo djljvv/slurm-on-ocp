@@ -1,0 +1,111 @@
+# First, create the required secrets (operator default names/keys):
+# oc create namespace slurm
+# JWT_KEY=$(openssl rand -base64 32)
+# SLURM_KEY=$(openssl rand -base64 32)
+# oc create secret generic slurm-auth-jwths256 -n slurm --from-literal=jwt_hs256.key="$JWT_KEY"
+# oc create secret generic slurm-auth-slurm -n slurm --from-literal=slurm.key="$SLURM_KEY"
+
+# Controller (Slurm Controller)
+# Note: Requires jwtHs256KeyRef and slurmKeyRef
+# Note: Include image field - operator may not set it automatically
+# Note: Resources go in spec.slurmctld.resources, NOT spec.resources
+apiVersion: slinky.slurm.net/v1beta1
+kind: Controller
+metadata:
+  name: slurm
+  namespace: slurm
+spec:
+  jwtHs256KeyRef:
+    name: slurm-auth-jwths256
+    key: jwt_hs256.key
+  slurmKeyRef:
+    name: slurm-auth-slurm
+    key: slurm.key
+  slurmctld:
+    image: 'ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04'
+    resources:
+      requests:
+        cpu: "2"
+        memory: "4Gi"
+      limits:
+        cpu: "4"
+        memory: "8Gi"
+  persistence:
+    enabled: true
+    resources:
+      requests:
+        storage: 4Gi
+    accessModes:
+      - ReadWriteOnce
+  reconfigure:
+    image: 'ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04'
+    resources: {}
+  logfile:
+    image: 'docker.io/library/alpine:latest'
+    resources: {}
+  extraConf: |
+    PartitionName=all Nodes=ALL Default=YES MaxTime=UNLIMITED State=UP
+    # Increase job retention time in memory (default is 300 seconds = 5 minutes)
+    # Set to 3600 seconds (1 hour) - adjust as needed
+    MinJobAge=3600
+---
+# NodeSet (Compute Nodes) - Note: requires controllerRef
+# IMPORTANT: Include image field - operator may not set it automatically
+# IMPORTANT: Resources go in spec.slurmd.resources (like Controller uses spec.slurmctld.resources)
+apiVersion: slinky.slurm.net/v1beta1
+kind: NodeSet
+metadata:
+  name: slurm-worker-slinky
+  namespace: slurm
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: slurm
+    app.kubernetes.io/version: '25.11'
+    helm.sh/chart: slurm-0.4.1
+    nodeset.slinky.slurm.net/name: slurm-worker-slinky
+spec:
+  controllerRef:
+    name: slurm
+    namespace: slurm
+  replicas: 2
+  partition:
+    enabled: true
+  slurmd:
+    image: 'ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04'
+    resources:
+      requests:
+        cpu: "1"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    env:
+      - name: POD_CPUS
+        value: '0'
+      - name: POD_MEMORY
+        value: '0'
+  logfile:
+    image: 'docker.io/library/alpine:latest'
+    resources: {}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: slurm
+        app.kubernetes.io/version: '25.11'
+        helm.sh/chart: slurm-0.4.1
+        nodeset.slinky.slurm.net/name: slurm-worker-slinky
+    spec:
+      affinity: {}
+      hostname: slinky-
+      imagePullSecrets: null
+      initContainers: []
+      nodeSelector:
+        kubernetes.io/os: linux
+      priorityClassName: null
+      tolerations: []
+      volumes: []
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 100%
+    type: RollingUpdate

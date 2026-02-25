@@ -1,0 +1,143 @@
+# Slurm Cluster Helm Values
+# Customize these values when deploying the cluster via Helm:
+#   helm install slurm oci://ghcr.io/slinkyproject/charts/slurm -n slurm -f configs/slurm-values.yaml
+#
+# For the standard deployment (OperatorHub or Helm-installed operator + YAML):
+#   Only configs/slurm-cluster.yaml is required: oc apply -f configs/slurm-cluster.yaml
+#   This file is NOT used for that flow.
+#
+
+# Controller configuration
+controller:
+  replicas: 1
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  
+  # Storage configuration
+  storage:
+    # Use persistent volume for shared filesystem
+    enabled: true
+    size: "50Gi"
+    storageClassName: ""  # Use default storage class if empty
+
+# Compute node configuration
+compute:
+  # Initial number of compute nodes
+  replicas: 2
+  
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  
+  # Node selector for compute nodes (optional)
+  # nodeSelector:
+  #   workload-type: compute
+  
+  # Tolerations for compute nodes (optional)
+  # tolerations:
+  #   - key: "workload-type"
+  #     operator: "Equal"
+  #     value: "compute"
+  #     effect: "NoSchedule"
+
+# Autoscaling configuration
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 10
+  
+  # Scaling behavior
+  scaleDownDelay: "5m"
+  scaleUpDelay: "0s"
+
+# Slurm configuration
+slurm:
+  # Partition configuration
+  partitions:
+    - name: "default"
+      default: true
+      maxTime: "24:00:00"
+      nodes: "ALL"
+  
+  # Accounting (optional)
+  accounting:
+    enabled: false
+    # storage:
+    #   size: "20Gi"
+
+# GPU support configuration
+gpu:
+  enabled: false  # Set to true if GPU nodes are available
+  
+  # NVIDIA GPU configuration
+  nvidia:
+    enabled: false
+    # Device plugin namespace (if using NVIDIA device plugin)
+    # devicePluginNamespace: "nvidia-device-plugin"
+  
+  # AMD GPU configuration
+  amd:
+    enabled: false
+    # Device plugin namespace (if using AMD device plugin)
+    # devicePluginNamespace: "amd-device-plugin"
+  
+  # Intel GPU configuration
+  intel:
+    enabled: false
+    # Device plugin namespace (if using Intel device plugin)
+    # devicePluginNamespace: "intel-device-plugin"
+
+# Networking
+network:
+  # Service type for Slurm services
+  serviceType: ClusterIP
+  
+  # Network policies (if enabled in cluster)
+  networkPolicies:
+    enabled: false
+
+# Monitoring
+monitoring:
+  enabled: false
+  # Prometheus service monitor
+  serviceMonitor:
+    enabled: false
+
+# Security
+security:
+  # Service account
+  serviceAccount:
+    create: true
+    name: ""
+  
+  # Pod security context
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+
+# Image configuration (override defaults if needed)
+images:
+  controller:
+    repository: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+  
+  compute:
+    repository: ""
+    tag: ""
+    pullPolicy: IfNotPresent
+
+# Additional configuration
+extraConfig: |
+  # Add custom Slurm configuration here
+  # This will be appended to slurm.conf

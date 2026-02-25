@@ -1,0 +1,1279 @@
+# Step-by-Step Deployment Guide - Slurm on OpenShift
+
+## Overview
+
+This guide provides **two methods** to deploy Slurm on OpenShift for the POC:
+1. **Terminal/CLI Method** (using `oc` and `helm` commands) - Recommended for automation
+2. **Browser UI Method** (using OpenShift Web Console) - Easier for beginners
+
+### Why two namespaces? (slinky vs slurm)
+
+You will see two projects/namespaces. **Both are needed;** they have different roles:
+
+| Namespace | Purpose | What runs there |
+|-----------|---------|------------------|
+| **slinky** | Operator (the "manager") | Slurm Operator CRDs, Slurm Operator pod. The operator watches the cluster and reconciles Controller/NodeSet resources. |
+| **slurm** | Workload (your cluster) | Controller CR, NodeSet CR, Slurm controller pod (slurmctld), compute pods (slurmd), secrets, services. This is the actual Slurm cluster you run jobs on. |
+
+**In short:** The operator lives in **slinky** and manages resources you create in **slurm**. You need both: remove slinky and the operator stops; remove slurm and you have no Slurm cluster (only the operator).
+
+---
+
+## Method 1: Terminal/CLI Deployment (Recommended)
+
+### Prerequisites Check
+
+```bash
+# 1. Verify you're logged in to OpenShift
+oc whoami
+# Should show: pvuda@redhat.com
+
+# 2. Verify cluster access
+oc get nodes
+# Should list your cluster nodes
+
+# 3. Check if helm is installed
+helm version
+# Should show Helm v3.x
+```
+
+### Step 1: Verify cert-manager (Prerequisite)
+
+cert-manager is required for TLS certificates used by the Slurm operator. It automates certificate management for secure communication.
+
+**Why cert-manager is needed:**
+- The Slurm operator requires TLS certificates for secure inter-component communication
+- cert-manager automatically issues, renews, and manages these certificates
+- Without it, the operator cannot create required certificates and may fail to start
+
+**Check if cert-manager is already installed:**
+
+```bash
+# Check if cert-manager pods exist
+oc get pods -n cert-manager
+
+# If you see pods like cert-manager-xxx, cert-manager-cainjector-xxx, cert-manager-webhook-xxx
+# then cert-manager is already installed - SKIP to Step 2!
+```
+
+**If cert-manager is NOT installed, install it:**
+
+**Option A: Via OpenShift UI (Recommended for OpenShift)**
+1. Go to "Ecosystem" → "Software Catalog"
+2. Search for "cert-manager Operator for Red Hat OpenShift"
+3. Click "Install" → Select namespace → Install
+
+**Option B: Via Helm (if not using OpenShift operator)**
+```bash
+# Add Jetstack Helm repository
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+
+# Install cert-manager
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --set installCRDs=true \
+  --set 'crds.enabled=true' \
+  --version v1.13.0 \
+  --wait --timeout 5m
+
+# Verify installation
+oc get pods -n cert-manager
+# Wait until all pods show "Running" status
+```
+
+**Expected Output:**
+```
+NAME                                      READY   STATUS    RESTARTS   AGE
+cert-manager-xxx                          1/1     Running   0          2m
+cert-manager-cainjector-xxx               1/1     Running   0          2m
+cert-manager-webhook-xxx                  1/1     Running   0          2m
+```
+
+### Step 2: Install Slurm Operator CRDs
+
+```bash
+# Check if CRDs are already installed (skip if already installed)
+if oc get crd controllers.slinky.slurm.net &>/dev/null; then
+  echo "CRDs already installed, skipping..."
+else
+  # Install Slurm Operator CRDs
+  helm install slurm-operator-crds \
+    oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
+    --namespace slinky \
+    --create-namespace \
+    --server-side=false
+
+  # Wait a few seconds for CRDs to be registered
+  sleep 10
+fi
+
+# Verify CRDs are installed
+oc get crds | grep slurm
+```
+
+**Expected Output (Helm installs Slinky CRDs):**
+```
+controllers.slinky.slurm.net
+nodesets.slinky.slurm.net
+```
+*(If you installed via OperatorHub you may see different CRD names; use Option B in Step 4 to deploy the cluster.)*
+
+### Step 3: Install Slurm Operator
+
+```bash
+# Check if operator is already installed (skip if already installed)
+if oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator &>/dev/null || \
+   oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator &>/dev/null; then
+  echo "Slurm Operator already installed, skipping..."
+else
+  # Install Slurm Operator
+  helm install slurm-operator \
+    oci://ghcr.io/slinkyproject/charts/slurm-operator \
+    --namespace slinky \
+    --create-namespace \
+    --server-side=false \
+    --wait --timeout 5m
+fi
+
+# Verify operator is running (namespace depends on installation method)
+# Try OperatorHub first (most common), then Helm namespace
+oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator 2>/dev/null || \
+oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator
+
+# To uninstall an operator
+helm uninstall slurm-operator -n slinky
+```
+
+**Expected Output:**
+```
+NAME                               READY   STATUS    RESTARTS   AGE
+slurm-operator-xxx                  1/1     Running   0          1m
+```
+
+### Step 4: Deploy Slurm Cluster
+
+If operator is installed via Software Catalog/OperatorHub, use Option B (Direct YAML). The repo uses the v1beta1 API for Controller and NodeSet.
+
+#### Option A: Using Deployment Script (RECOMMENDED)
+
+```bash
+# The script automatically detects OperatorHub installation and uses direct YAML
+./scripts/deploy-slurm.sh --skip-operator
+```
+
+This will:
+- Detect existing CRDs and operator (skip installation)
+- Deploy cluster using direct YAML (works with OperatorHub)
+- Handle all setup automatically
+
+#### Option B: Using Direct YAML (Works with OperatorHub)
+
+```bash
+# 1. Create namespace and configure security
+oc create namespace slurm 2>/dev/null || true
+oc adm policy add-scc-to-user anyuid -z default -n slurm
+
+# 2. Create secrets (operator default names/keys so UI template works without editing refs)
+JWT_KEY=$(openssl rand -base64 32)
+SLURM_KEY=$(openssl rand -base64 32)
+oc create secret generic slurm-auth-jwths256 -n slurm \
+  --from-literal=jwt_hs256.key="$JWT_KEY" \
+  --dry-run=client -o yaml | oc apply -f -
+oc create secret generic slurm-auth-slurm -n slurm \
+  --from-literal=slurm.key="$SLURM_KEY" \
+  --dry-run=client -o yaml | oc apply -f -
+
+# 3. Deploy using the config file (uses v1beta1 API)
+oc apply -f configs/slurm-cluster.yaml
+```
+
+#### Option C: Using Helm Chart (Only if operator installed via Helm)
+
+This only works if the operator was installed via Helm (not OperatorHub).
+
+```bash
+# Create namespace and secrets first (operator default names/keys)
+oc create namespace slurm 2>/dev/null || true
+JWT_KEY=$(openssl rand -base64 32)
+SLURM_KEY=$(openssl rand -base64 32)
+oc create secret generic slurm-auth-jwths256 -n slurm --from-literal=jwt_hs256.key="$JWT_KEY"
+oc create secret generic slurm-auth-slurm -n slurm --from-literal=slurm.key="$SLURM_KEY"
+
+# Deploy with default settings (--server-side=false avoids metadata.managedFields errors)
+helm upgrade --install slurm \
+  oci://ghcr.io/slinkyproject/charts/slurm \
+  --namespace slurm \
+  --create-namespace \
+  --server-side=false \
+  --wait --timeout 10m
+```
+
+**Note:** The Helm chart typically creates a Controller whose name matches the release (e.g. `slurm`). Use `oc get controllers -n slurm` to see the exact name; then e.g. `oc describe controller slurm -n slurm`.
+
+**If you get version mismatch or "no matches for kind Controller" errors:**
+- Check the CRD supports v1beta1: `oc get crd controllers.slinky.slurm.net -o jsonpath='{.spec.versions[*].name}'`
+- Ensure your YAML uses `apiVersion: slinky.slurm.net/v1beta1` for both Controller and NodeSet.
+- Or use Option B (Direct YAML) or the deployment script (Option A).
+
+### Step 5: Verify Deployment
+
+```bash
+# Check all pods (namespace: slurm by default, or your custom namespace)
+oc get pods -n slurm
+
+# Check Controller and NodeSet resources (not SlurmCluster - that's the old API)
+oc get controllers,nodesets -n slurm
+# Use the controller name from the list above (e.g. slurm)
+oc describe controller <controller-name> -n slurm
+
+# Check services
+oc get svc -n slurm
+```
+
+**Expected Output:**
+```
+NAME                          READY   STATUS    RESTARTS   AGE
+slurm-controller-xxx          1/1     Running   0          2m
+slurm-worker-slinky-0         1/1     Running   0          2m
+slurm-worker-slinky-1         1/1     Running   0          2m
+```
+
+### Step 6: Test Slurm Cluster
+
+```bash
+# Get controller pod name
+CONTROLLER_POD=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
+
+# Check cluster info
+oc exec -n slurm $CONTROLLER_POD -c slurmctld -- sinfo
+
+# Submit a test job
+oc exec -n slurm $CONTROLLER_POD -c slurmctld -- sbatch --output=/tmp/test.out --wrap="echo 'Hello from Slurm' && hostname && date"
+
+# Check job queue
+oc exec -n slurm $CONTROLLER_POD -c slurmctld -- squeue
+
+# Check job status (get job ID from squeue output)
+oc exec -n slurm $CONTROLLER_POD -c slurmctld -- scontrol show job <JOB_ID>
+
+# Find which node ran the job
+oc exec -n slurm $CONTROLLER_POD -c slurmctld -- scontrol show job <JOB_ID> | grep NodeList
+
+# View job output (on the compute node that ran it)
+# If NodeList=slinky-0, use slurm-worker-slinky-0; if slinky-1, use slurm-worker-slinky-1
+oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- cat /tmp/test.out 2>/dev/null || \
+oc exec -n slurm slurm-worker-slinky-1 -c slurmd -- cat /tmp/test.out
+```
+
+**Troubleshooting Step 6:**
+- **"container not found (slurmctld)"** — The controller pod may still be in Init (0/1 or Init:0/2). Wait until the pod is **Running** and **1/1** (or 3/3). Check with: `oc get pods -n slurm -l app.kubernetes.io/name=slurmctld`.
+- **"container not found (slurmd)"** — The slurmd container may not be running (e.g. pod still initializing or slurmd crashing). Check: (1) Pod status: `oc get pods -n slurm -l app.kubernetes.io/name=slurmd` — ensure **Running** and **Ready**. (2) List container names: `oc get pod <slurmd-pod> -n slurm -o jsonpath='{.spec.containers[*].name}'` — use that name with `-c`. (3) If the controller is in CrashLoopBackOff, fix the controller first; worker pods often wait or fail until the controller is Ready.
+- **"Unable to contact slurm controller"** or **"Insane message length"** (controller logs: `on_data returned rc: Insane message length`) — Usually a **version or protocol mismatch** between slurmctld and the connecting slurmd, or **auth key mismatch** (slurm.key). Fix: (1) **Match images**: set `spec.slurmctld.image` and `spec.slurmd.image` to the same tag (e.g. `ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04` and `ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04`) in the Controller and NodeSet CRs. (2) **Verify what's running**: `oc get controller slurm -n slurm -o jsonpath='{.spec.slurmctld.image}'` and `oc get nodeset slurm-worker-slinky -n slurm -o jsonpath='{.spec.slurmd.image}'`; if the NodeSet has no image, the operator default may differ — add the image to the NodeSet and re-apply. (3) **Secrets**: Controller and workers must use the same `slurm.key` (from `slurm-auth-slurm`); the operator copies from the Controller's `slurmKeyRef` to workers — do not recreate the secret without redeploying. (4) **Clean restart**: delete worker pods so they stop connecting, let the controller become Ready, then workers will be recreated and reconnect: `oc delete pod -n slurm -l app.kubernetes.io/name=slurmd`; wait for controller to show Ready, then check `oc get pods -n slurm`.
+- **Slurmd: "Unable to contact slurm controller (connect failure)"** — Compute nodes reach the controller at `slurm-controller.slurm:6817`. Check: (1) Controller pod is **Running** and **Ready** first. (2) Service exists: `oc get svc -n slurm` (look for `slurm-controller` or similar with port 6817). (3) From a compute pod: `oc exec -n slurm <slurmd-pod> -c slurmd -- getent hosts slurm-controller.slurm` and test port 6817. If the service name is different (e.g. `slurm-controller-controller`), the image may expect a different hostname; fix by creating a Service that matches what slurmd uses, or restart compute pods after the controller is Ready so they retry. (4) Restart compute pods once the controller is Ready: `oc delete pod -n slurm -l app.kubernetes.io/name=slurmd`.
+- **SSSD "No domains configured" / "exited (exit status 4)"** — Expected when not using LDAP/AD. Slurmd and sshd still run; you can ignore SSSD for basic job execution. No change needed for POC.
+- **Image pull error (e.g. manifest unknown)** — Override the image in the Controller or NodeSet to one that exists (e.g. `ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04`). Edit with: `oc edit controller slurm -n slurm` and set `spec.slurmctld.image`.
+
+---
+
+## Method 2: Browser UI Deployment (OpenShift Web Console)
+
+### Prerequisites
+
+1. Access to OpenShift Web Console: `console-openshift-console.apps.ai-dev02.kni.syseng.devcluster.openshift.com`
+2. Cluster admin privileges
+3. Browser with access to the cluster
+
+### Step 1: Verify cert-manager (Prerequisite)
+
+**Why cert-manager is needed:**
+- The Slurm operator requires TLS certificates for secure communication
+- cert-manager automatically manages certificate lifecycle (issuance, renewal)
+- Without it, the operator cannot function properly
+
+**Check if already installed:**
+
+1. **Via Terminal:**
+   ```bash
+   oc get pods -n cert-manager
+   # If you see running pods, cert-manager is already installed - SKIP installation!
+   ```
+
+2. **Via UI:**
+   - Go to "Ecosystem" → "Software Catalog"
+   - Search for "cert-manager"
+   - If you see "cert-manager Operator for Red Hat OpenShift" with green "Installed" badge, it's already installed
+
+**If NOT installed, install via OperatorHub:**
+
+1. **Navigate to Ecosystem → Software Catalog**
+
+2. **Search for cert-manager**
+   - In the search box, type: `cert-manager`
+   - **Choose**: "cert-manager Operator for Red Hat OpenShift" (Red Hat certified version)
+
+3. **Install cert-manager**
+   - Click "Install" button
+   - **Installation mode**: Select "A specific namespace on the cluster"
+   - **Installed Namespace**: Select "Create new namespace" → Name: `cert-manager`
+   - **Update channel**: Select latest (e.g., "stable")
+   - **Approval strategy**: Select "Automatic" (or "Manual" if preferred)
+   - Click "Install"
+   - Wait for installation to complete (status shows "Succeeded")
+
+4. **Verify Installation**
+   - Go to "Ecosystem" → "Installed Operators"
+   - Filter by namespace: `cert-manager`
+   - Verify cert-manager shows "Succeeded" status
+   - Or check pods: "Workloads" → "Pods" → Filter: `cert-manager`
+
+### Step 2: Install Slurm Operator
+
+#### Option A: Install via OperatorHub (Recommended - UI Method)
+
+1. **Navigate to Ecosystem → Software Catalog**
+
+2. **Search for Slurm Operator**
+   - In the search box, type: `slinky` or `slurm`
+   - You should see "Slurm Operator" (provided by Red Hat HPC Community)
+   - Click on the "Slurm Operator" card
+
+3. **Install Slurm Operator**
+   - Click "Install" button
+   - **Installation mode**: Select "A specific namespace on the cluster"
+   - **Installed Namespace**: Select "Create new namespace" → Name: `slinky`
+   - **Update channel**: Select latest available (e.g., "stable" or "alpha")
+   - **Approval strategy**: Select "Automatic" (or "Manual" if preferred)
+   - Click "Install"
+   - Wait for installation to complete (status shows "Succeeded")
+
+4. **Verify Installation**
+   - Go to "Ecosystem" → "Installed Operators"
+   - Filter by namespace: `slinky`
+   - Verify "Slurm Operator" shows "Succeeded" status
+   - Or check pods: "Workloads" → "Pods" → Filter: `slinky`
+   - You should see `slurm-operator-xxx` pod in Running state
+
+#### Option B: Install via Helm (Alternative - Terminal Method)
+
+If you prefer using Helm or the OperatorHub installation doesn't work:
+
+```bash
+# Check if CRDs are already installed (skip if already installed)
+if oc get crd controllers.slinky.slurm.net &>/dev/null; then
+  echo "CRDs already installed, skipping..."
+else
+  # Install Slurm Operator CRDs
+  helm install slurm-operator-crds \
+    oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
+    --namespace slinky \
+    --create-namespace
+
+  # Wait a few seconds for CRDs to be registered
+  sleep 10
+fi
+
+# Verify CRDs are installed
+oc get crds | grep slurm
+
+# Check if operator is already installed (skip if already installed)
+if oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator &>/dev/null || \
+   oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator &>/dev/null; then
+  echo "Slurm Operator already installed, skipping..."
+else
+  # Install Slurm Operator
+  helm install slurm-operator \
+    oci://ghcr.io/slinkyproject/charts/slurm-operator \
+    --namespace slinky \
+    --create-namespace \
+    --wait --timeout 5m
+fi
+```
+
+**Verify in UI**:
+   - Go to "Workloads" → "Pods"
+   - Filter by namespace: `slinky`
+   - Verify `slurm-operator` pod is Running
+
+### Step 3: Deploy Slurm Cluster
+
+Now that the operator is installed, you can deploy a Slurm cluster. Follow these steps **IN ORDER**:
+
+Do NOT use "Create Deployment" page - it only accepts Deployment resources. Use the Operator UI's "Create Controller" and "Create NodeSet" options instead.
+
+#### Step 3.1: Create Namespace and Configure Security (FIRST STEP)
+
+**Via Terminal (Recommended):**
+```bash
+# Create namespace
+oc create namespace slurm
+
+# Grant anyuid SCC to the namespace's default service account
+# This allows pods to run with the UID required by Slurm (401)
+oc adm policy add-scc-to-user anyuid -z default -n slurm
+```
+
+**Via UI:**
+- Go to "Home" → "Projects"
+- Click "Create Project"
+- Name: `slurm`
+- Click "Create"
+- **Then via terminal**, grant SCC: `oc adm policy add-scc-to-user anyuid -z default -n slurm`
+
+#### Step 3.2: Create Required Secrets (SECOND STEP)
+
+The Controller requires JWT and Slurm keys. Create them **before** creating the Controller. Use the **operator default** secret names and key names so the Operator UI template works without editing secret references.
+
+**Secret structure (operator default):**
+- **Secret 1**: name `slurm-auth-jwths256`, key inside secret: `jwt_hs256.key` (random value)
+- **Secret 2**: name `slurm-auth-slurm`, key inside secret: `slurm.key` (random value)
+
+**Via Terminal (Recommended):**
+```bash
+# Generate keys and create secrets (operator default names/keys)
+JWT_KEY=$(openssl rand -base64 32)
+SLURM_KEY=$(openssl rand -base64 32)
+oc create secret generic slurm-auth-jwths256 -n slurm \
+  --from-literal=jwt_hs256.key="$JWT_KEY"
+oc create secret generic slurm-auth-slurm -n slurm \
+  --from-literal=slurm.key="$SLURM_KEY"
+
+# Verify secrets were created
+oc get secret slurm-auth-jwths256 slurm-auth-slurm -n slurm
+```
+
+   **Via UI:**
+   - Go to "Workloads" → "Secrets", namespace `slurm`
+   - **First secret:** Create → Key/value secret. **Name**: `slurm-auth-jwths256`. Add key `jwt_hs256.key`, value = random base64 (e.g. `openssl rand -base64 32`). Create.
+   - **Second secret:** Create → Key/value secret. **Name**: `slurm-auth-slurm`. Add key `slurm.key`, value = random base64. Create.
+   
+   **If pods fail to start because the secret is missing**, delete the pods so they restart:
+   ```bash
+   oc delete pod -n slurm -l app.kubernetes.io/name=slurmctld
+   oc delete pod -n slurm -l app.kubernetes.io/name=slurmd
+   ```
+
+#### Step 3.3: Create Controller (THIRD STEP)
+
+**Via Operator UI:**
+
+1. **Navigate to the Slurm Operator**
+   - Go to **"Ecosystem"** → **"Installed Operators"**
+   - Filter by namespace: `openshift-operators`
+   - Click on **"Slurm Operator"**
+
+2. **Find the Controller Resource Type**
+   - Look for a section showing "Provided APIs" or "Resource Types"
+   - You should see **"Controller"** listed
+   - Click on **"Controller"**, OR
+   - Look for "Create Instance" or "Create Controller" button
+   - If you see "All instances" tab, click it, then click "+ Create"
+
+3. **Create Controller**
+   - You should be on the **"Create Controller"** page
+   - Select **"YAML view"** (not Form view)
+   - You'll see a default YAML template - **MODIFY it** with the following changes:
+
+**Complete YAML (with all defaults + our changes):**
+
+```yaml
+apiVersion: slinky.slurm.net/v1beta1
+kind: Controller
+metadata:
+  name: slurm
+  namespace: slurm
+spec:
+  accountingRef:
+    name: slurm
+    namespace: slurm
+  jwtHs256KeyRef:
+    key: jwt_hs256.key
+    name: slurm-auth-jwths256
+  slurmKeyRef:
+    key: slurm.key
+    name: slurm-auth-slurm
+  slurmctld:
+    image: 'ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04'
+    resources:
+      requests:
+        cpu: "2"
+        memory: "4Gi"
+      limits:
+        cpu: "4"
+        memory: "8Gi"
+  persistence:
+    enabled: true
+    resources:
+      requests:
+        storage: 4Gi
+    accessModes:
+      - ReadWriteOnce
+  reconfigure:
+    image: 'ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04'
+    resources: {}
+  logfile:
+    image: 'docker.io/library/alpine:latest'
+    resources: {}
+  extraConf: |
+    PartitionName=all Nodes=ALL Default=YES MaxTime=UNLIMITED State=UP
+    # Increase job retention time in memory (default is 300 seconds = 5 minutes)
+    # Set to 3600 seconds (1 hour) - adjust as needed
+    MinJobAge=3600
+```
+
+**Or use the minimal version (if you want to keep it simple):**
+
+```yaml
+apiVersion: slinky.slurm.net/v1beta1
+kind: Controller
+metadata:
+  name: slurm
+  namespace: slurm
+spec:
+  jwtHs256KeyRef:
+    name: slurm-auth-jwths256
+    key: jwt_hs256.key
+  slurmKeyRef:
+    name: slurm-auth-slurm
+    key: slurm.key
+  slurmctld:
+    image: 'ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04'
+    resources:
+      requests:
+        cpu: "2"
+        memory: "4Gi"
+      limits:
+        cpu: "4"
+        memory: "8Gi"
+```
+
+1. **Click "Create"**
+   - Wait for the Controller to be created (status should show as Ready)
+
+**Via Terminal (Alternative):**
+```bash
+oc apply -f - <<EOF
+apiVersion: slinky.slurm.net/v1beta1
+kind: Controller
+metadata:
+  name: slurm
+  namespace: slurm
+spec:
+  jwtHs256KeyRef:
+    name: slurm-auth-jwths256
+    key: jwt_hs256.key
+  slurmKeyRef:
+    name: slurm-auth-slurm
+    key: slurm.key
+  slurmctld:
+    image: 'ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04'
+    resources:
+      requests:
+        cpu: "2"
+        memory: "4Gi"
+      limits:
+        cpu: "4"
+        memory: "8Gi"
+  persistence:
+    enabled: true
+    resources:
+      requests:
+        storage: 4Gi
+    accessModes:
+      - ReadWriteOnce
+EOF
+```
+
+#### Step 3.4: Create NodeSet (FOURTH STEP - After Controller is Ready)
+
+**Important:** Resources in NodeSet go under `spec.slurmd.resources`, NOT directly under `spec.resources`.
+
+**Via Operator UI:**
+
+1. **Navigate back to the Slurm Operator**
+   - Go to **"Ecosystem"** → **"Installed Operators"** → **"Slurm Operator"**
+
+2. **Find the NodeSet Resource Type**
+   - Look for **"NodeSet"** in the resource types
+   - Click on **"NodeSet"**
+   - Click **"Create NodeSet"**
+
+3. **Create NodeSet**
+   - Select **"YAML view"**
+   - You'll see a default YAML template - **MODIFY it** with the following changes:
+
+
+
+**Complete YAML (with defaults + our changes):**
+
+Use the OCP default NodeSet name `slurm-worker-slinky` so you don't have to change it.
+
+```yaml
+apiVersion: slinky.slurm.net/v1beta1
+kind: NodeSet
+metadata:
+  name: slurm-worker-slinky
+  namespace: slurm
+  labels:
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: slurm
+    app.kubernetes.io/version: '25.11'
+    helm.sh/chart: slurm-0.4.1
+    nodeset.slinky.slurm.net/name: slurm-worker-slinky
+spec:
+  controllerRef:
+    name: slurm
+    namespace: slurm
+  replicas: 2
+  partition:
+    enabled: true
+  slurmd:
+    image: 'ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04'
+    resources:
+      requests:
+        cpu: "1"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    env:
+      - name: POD_CPUS
+        value: '0'
+      - name: POD_MEMORY
+        value: '0'
+  logfile:
+    image: 'docker.io/library/alpine:latest'
+    resources: {}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/part-of: slurm
+        app.kubernetes.io/version: '25.11'
+        helm.sh/chart: slurm-0.4.1
+        nodeset.slinky.slurm.net/name: slurm-worker-slinky
+    spec:
+      affinity: {}
+      hostname: slinky-
+      imagePullSecrets: null
+      initContainers: []
+      nodeSelector:
+        kubernetes.io/os: linux
+      priorityClassName: null
+      tolerations: []
+      volumes: []
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 100%
+    type: RollingUpdate
+```
+
+**Or use the minimal version (OCP default name):**
+
+```yaml
+apiVersion: slinky.slurm.net/v1beta1
+kind: NodeSet
+metadata:
+  name: slurm-worker-slinky
+  namespace: slurm
+spec:
+  controllerRef:
+    name: slurm
+    namespace: slurm
+  replicas: 2
+  slurmd:
+    image: 'ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04'
+    resources:
+      requests:
+        cpu: "1"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+```
+
+1. **Click "Create"**
+
+**Via Terminal (Alternative, OCP default name):**
+```bash
+oc apply -f - <<EOF
+apiVersion: slinky.slurm.net/v1beta1
+kind: NodeSet
+metadata:
+  name: slurm-worker-slinky
+  namespace: slurm
+spec:
+  controllerRef:
+    name: slurm
+    namespace: slurm
+  replicas: 2
+  slurmd:
+    image: 'ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04'
+    resources:
+      requests:
+        cpu: "1"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+EOF
+```
+
+**Alternative: Generic YAML Import (if Operator UI doesn't show Create button)**
+   - Go to **"Workloads"** → **"Topology"** (or any page with "+" button)
+   - Click **"+"** in top right
+   - Select **"Import YAML"** (NOT "Create Deployment")
+   - Paste the YAML above
+   - Click "Create"
+
+**Note**: If you're looking at the operator Deployment details page (like the Actions menu), that's the operator itself, not where you create the cluster. Navigate back to the Operator page to create Controller and NodeSet.
+
+### Step 4: Monitor Deployment via UI
+
+**Via Terminal:**
+```bash
+# Check Controller and NodeSet resources (namespace: slurm by default, or your custom namespace)
+oc get controllers -n slurm
+oc get nodesets -n slurm
+oc describe controller slurm -n slurm
+oc describe nodeset slurm-worker-slinky -n slurm
+
+# Check pods being created
+oc get pods -n slurm
+
+# Watch pods (they may take a few minutes to start)
+oc get pods -n slurm -w
+```
+
+**Via UI:**
+
+1. **Check Pods**:
+   - Go to "Workloads" → "Pods"
+   - Filter by namespace: `slurm`
+   - You should see:
+     - `slurm-controller-0` (Running)
+     - `slurm-worker-slinky-0` (Running)
+     - `slurm-worker-slinky-1` (Running)
+   - Note: Pods may take 1-3 minutes to start
+
+2. **Check Controller and NodeSet Resources**:
+   - Go to "Operators" → "Installed Operators"
+   - Click on "Slurm Operator"
+   - Click "Controller" tab to see your controller
+   - Click "NodeSet" tab to see your compute nodes
+   - Or check via terminal: `oc get controllers,nodesets -n slurm`
+
+3. **Check Services**:
+   - Go to "Networking" → "Services"
+   - Filter by namespace: `slurm`
+   - Verify Slurm services are created
+
+### Step 5: Access Slurm via Terminal Pod
+
+1. **Open Terminal in Pod**:
+   - Go to "Workloads" → "Pods"
+   - Find `slurm-controller-xxx` pod
+   - Click on the pod name
+   - Click "Terminal" tab
+
+2. **Test Slurm Commands**:
+   
+   **If using UI Terminal (inside the pod):**
+   ```bash
+   # When you're inside the pod terminal via UI, you can run commands directly:
+   sinfo
+   scontrol show nodes
+   sbatch --output=/tmp/test.out --wrap="echo 'Hello from Slurm' && hostname && date"
+   squeue
+   scontrol show job <JOB_ID>
+   ```
+   
+   **If using your local terminal (via oc exec):**
+   ```bash
+   # First, set the controller pod variable
+   CONTROLLER_POD=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
+   
+   # Then run commands with oc exec (note: -c slurmctld is REQUIRED)
+   oc exec -n slurm $CONTROLLER_POD -c slurmctld -- sinfo
+   oc exec -n slurm $CONTROLLER_POD -c slurmctld -- scontrol show nodes
+   oc exec -n slurm $CONTROLLER_POD -c slurmctld -- sbatch --output=/tmp/test.out --wrap="echo 'Hello from Slurm' && hostname && date"
+   oc exec -n slurm $CONTROLLER_POD -c slurmctld -- squeue
+   oc exec -n slurm $CONTROLLER_POD -c slurmctld -- scontrol show job <JOB_ID>
+   
+   # Find which node ran the job
+   oc exec -n slurm $CONTROLLER_POD -c slurmctld -- scontrol show job <JOB_ID> | grep NodeList
+   
+   # View job output (on the compute node that ran it)
+   # If NodeList=slinky-0, use slurm-worker-slinky-0; if slinky-1, use slurm-worker-slinky-1
+   oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- cat /tmp/test.out 2>/dev/null || \
+   oc exec -n slurm slurm-worker-slinky-1 -c slurmd -- cat /tmp/test.out
+   ```
+   
+   **Important:** If you're running commands from your local terminal (not inside the pod), you MUST use `oc exec` with the `-c slurmctld` flag. Slurm commands are NOT installed on your local machine.
+
+#### Complete Terminal Method (All Steps in Order)
+
+If you prefer to do everything via terminal, here's the complete sequence:
+
+```bash
+# Step 1: Create namespace and configure security
+oc create namespace slurm
+
+# Grant anyuid SCC to allow Slurm to run with required UID (401)
+oc adm policy add-scc-to-user anyuid -z default -n slurm
+
+# Step 2: Create required secrets (operator default names/keys)
+JWT_KEY=$(openssl rand -base64 32)
+SLURM_KEY=$(openssl rand -base64 32)
+oc create secret generic slurm-auth-jwths256 -n slurm --from-literal=jwt_hs256.key="$JWT_KEY"
+oc create secret generic slurm-auth-slurm -n slurm --from-literal=slurm.key="$SLURM_KEY"
+
+# Step 3: Create Controller (use name: slurm; do not change name after creation)
+oc apply -f - <<EOF
+apiVersion: slinky.slurm.net/v1beta1
+kind: Controller
+metadata:
+  name: slurm
+  namespace: slurm
+spec:
+  jwtHs256KeyRef:
+    name: slurm-auth-jwths256
+    key: jwt_hs256.key
+  slurmKeyRef:
+    name: slurm-auth-slurm
+    key: slurm.key
+  slurmctld:
+    image: 'ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04'
+    resources:
+      requests:
+        cpu: "2"
+        memory: "4Gi"
+      limits:
+        cpu: "4"
+        memory: "8Gi"
+  persistence:
+    enabled: true
+    resources:
+      requests:
+        storage: 4Gi
+    accessModes:
+      - ReadWriteOnce
+EOF
+
+# Step 4: Wait for Controller to be ready (optional but recommended)
+oc wait --for=condition=Ready controller/slurm -n slurm --timeout=300s 2>/dev/null || true
+# If wait fails (e.g. condition not supported), just wait for pods: oc get pods -n slurm -w
+
+# Step 5: Create NodeSet (OCP default name: slurm-worker-slinky; controllerRef.name must match Controller: slurm)
+oc apply -f - <<EOF
+apiVersion: slinky.slurm.net/v1beta1
+kind: NodeSet
+metadata:
+  name: slurm-worker-slinky
+  namespace: slurm
+spec:
+  controllerRef:
+    name: slurm
+    namespace: slurm
+  replicas: 2
+  slurmd:
+    resources:
+      requests:
+        cpu: "1"
+        memory: "2Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+EOF
+
+# Step 6: Verify resources were created
+oc get controllers -n slurm
+oc get nodesets -n slurm
+oc get pods -n slurm
+```
+
+---
+
+## Step-by-Step POC Execution (Hybrid Approach)
+
+### Phase 1: Deployment (Terminal)
+
+```bash
+# 1. Login to OpenShift
+oc login https://api.ai-dev02.kni.syseng.devcluster.openshift.com:6443
+
+# 2. Run deployment script (from your repo root)
+cd /path/to/slurm
+./scripts/deploy-slurm.sh --skip-operator
+# Or with custom values: ./scripts/deploy-slurm.sh --skip-operator --values-file configs/slurm-values.yaml
+
+# 3. Wait for deployment (script handles this)
+```
+
+### Phase 2: Verification (Browser UI)
+
+1. Open browser: `console-openshift-console.apps.ai-dev02.kni.syseng.devcluster.openshift.com`
+2. Navigate to "Workloads" → "Pods" → Filter: `slurm`
+3. Verify all pods are "Running"
+4. Check "Operators" → "Installed Operators" → "Slurm Operator"
+
+### Phase 3: Testing (Terminal)
+
+```bash
+# Get controller pod
+CONTROLLER_POD=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
+
+# Run test jobs
+./scripts/test-slurm.sh --comprehensive --namespace slurm
+
+# Or manually test (namespace: slurm by default, or your custom namespace)
+oc exec -n slurm $CONTROLLER_POD -c slurmctld -- sinfo
+oc exec -n slurm $CONTROLLER_POD -c slurmctld -- sbatch --wrap="echo 'Test job' && sleep 10"
+oc exec -n slurm $CONTROLLER_POD -c slurmctld -- squeue
+```
+
+### Phase 4: Monitoring (Browser UI)
+
+1. View pod logs: "Workloads" → "Pods" → Click pod → "Logs" tab
+2. View events: "Observe" → "Events" → Filter by namespace: `slurm`
+3. View resource usage: "Observe" → "Metrics" → Select namespace: `slurm`
+
+---
+
+## Step 6: Test the Slurm Cluster
+
+Now that your cluster is deployed and running, let's test it by submitting jobs and viewing the output.
+
+**⚠️ Important: Slurm commands must run INSIDE the pod**
+
+Slurm commands (`sbatch`, `sinfo`, `squeue`, etc.) are **NOT** installed on your local machine. You must use `oc exec` to run them inside the controller pod.
+
+**Quick Setup (do this first):**
+```bash
+# Set the controller pod variable (do this once per terminal session)
+CONTROLLER_POD=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
+
+# Verify it's set
+echo $CONTROLLER_POD
+# Should show: slurm-controller-0
+```
+
+**All Slurm commands must use this format:**
+```bash
+oc exec -n slurm $CONTROLLER_POD -c slurmctld -- <slurm-command>
+```
+
+**Note:** The `-c slurmctld` flag is **REQUIRED** - it specifies which container in the pod to use.
+
+### Test 1: Basic Job Submission and Output
+
+**Objective**: Submit a simple job and verify it completes successfully.
+
+**Via Terminal:**
+
+```bash
+# 1. Check cluster status
+oc exec -n slurm slurm-controller-0 -c slurmctld -- sinfo
+
+# 2. Check available nodes
+oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show nodes
+
+# 3. Submit a simple test job
+oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch --output=/tmp/test-job.out --wrap="echo 'Hello from Slurm!' && hostname && date && echo 'Job completed successfully'"
+
+# Output will show: Submitted batch job <JOB_ID>
+# Note the JOB_ID (e.g., 1, 2, 3, etc.)
+```
+
+**Check Job Status:**
+
+```bash
+# Wait a few seconds, then check if job is in queue
+oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue
+
+# If queue is empty, job completed quickly. Check detailed status:
+oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job <JOB_ID>
+
+# Look for:
+# - JobState=COMPLETED
+# - ExitCode=0:0 (success)
+# - StdOut=/tmp/test-job.out (output file path)
+# - NodeList=slinky-1 (which compute node ran it)
+```
+
+**View Job Output:**
+
+```bash
+# Step 1: Find which compute node ran the job
+oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job <JOB_ID> | grep NodeList
+
+# Step 2: Map NodeList to compute pod
+# NodeList=slinky-0 → slurm-worker-slinky-0
+# NodeList=slinky-1 → slurm-worker-slinky-1
+
+# Step 3: View output on the correct compute node
+# If NodeList shows slinky-0:
+oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- cat /tmp/test-job.out
+
+# If NodeList shows slinky-1:
+oc exec -n slurm slurm-worker-slinky-1 -c slurmd -- cat /tmp/test-job.out
+
+# Step 4: Or try both nodes (if you're not sure - RECOMMENDED)
+oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- cat /tmp/test-job.out 2>/dev/null || \
+oc exec -n slurm slurm-worker-slinky-1 -c slurmd -- cat /tmp/test-job.out
+
+# Expected output:
+# Hello from Slurm!
+# slinky-0 (or slinky-1, depending on which node ran it)
+# Mon Nov 24 19:28:16 UTC 2025
+# Job completed successfully
+```
+
+### Test 2: Multiple Jobs and Queue Monitoring
+
+**Objective**: Submit multiple jobs and monitor the queue.
+
+```bash
+# Submit 3 jobs
+oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch --output=/tmp/job1.out --wrap="sleep 5 && echo 'Job 1 done'"
+oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch --output=/tmp/job2.out --wrap="sleep 5 && echo 'Job 2 done'"
+oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch --output=/tmp/job3.out --wrap="sleep 5 && echo 'Job 3 done'"
+
+# Monitor queue in real-time
+watch -n 2 "oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue"
+
+# Or check once
+oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue
+
+# Check all job statuses
+oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job
+```
+
+### Test 3: Job with Resource Requirements
+
+**Objective**: Submit a job requesting specific CPU and memory.
+
+```bash
+# Submit job requesting 1 CPU and 1GB memory
+oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch \
+  --cpus-per-task=1 \
+  --mem=1G \
+  --output=/tmp/resource-job.out \
+  --wrap="echo 'CPU: ' && nproc && echo 'Memory: ' && free -h && echo 'Job with resource requirements completed'"
+
+# Check job details to verify resources were allocated
+oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job <JOB_ID> | grep -E "(ReqTRES|AllocTRES|NumCPUs|NodeList)"
+
+# Find which node ran the job and view output
+NODE=$(oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job <JOB_ID> | grep NodeList | awk '{print $1}' | cut -d= -f2)
+echo "Job ran on: $NODE"
+
+# View output (try both nodes if unsure)
+oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- cat /tmp/resource-job.out 2>/dev/null || \
+oc exec -n slurm slurm-worker-slinky-1 -c slurmd -- cat /tmp/resource-job.out
+```
+
+### Test 4: Long-Running Job
+
+**Objective**: Submit a job that runs for a longer duration to test monitoring.
+
+```bash
+# Submit a job that runs for 30 seconds
+oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch --output=/tmp/long-job.out --wrap='for i in $(seq 1 30); do echo "Iteration $i at $(date)"; sleep 1; done'
+
+# Monitor the job while it's running
+oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue
+
+# Check job status and find which node ran it
+oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job <JOB_ID> | grep -E "(JobState|ExitCode|NodeList|StdOut)"
+
+# View output (try both nodes)
+oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- cat /tmp/long-job.out 2>/dev/null || \
+oc exec -n slurm slurm-worker-slinky-1 -c slurmd -- cat /tmp/long-job.out
+```
+
+### Test 5: Check All Output Files
+
+**Objective**: View all job outputs from recent test jobs.
+
+```bash
+# List all output files on both compute nodes
+echo "=== Files on compute-0 ==="
+oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- ls -la /tmp/*.out 2>/dev/null || echo "No files found on compute-0"
+
+echo "=== Files on compute-1 ==="
+oc exec -n slurm slurm-worker-slinky-1 -c slurmd -- ls -la /tmp/*.out 2>/dev/null || echo "No files found on compute-1"
+
+# View all outputs from compute-0
+oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- sh -c 'for f in /tmp/*.out 2>/dev/null; do [ -f "$f" ] && echo "=== $f (compute-0) ===" && cat "$f" && echo ""; done'
+
+# View all outputs from compute-1
+oc exec -n slurm slurm-worker-slinky-1 -c slurmd -- sh -c 'for f in /tmp/*.out 2>/dev/null; do [ -f "$f" ] && echo "=== $f (compute-1) ===" && cat "$f" && echo ""; done'
+```
+
+### Test 6: Verify Job Retention
+
+**Objective**: Verify that completed jobs remain accessible (thanks to MinJobAge=3600).
+
+```bash
+# Submit a job
+oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch --output=/tmp/retention-test.out --wrap="echo 'Testing job retention' && date"
+
+# Wait for it to complete
+sleep 5
+
+# Check job status immediately
+JOB_ID=$(oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue -h -o "%i" 2>/dev/null | head -1 || echo "")
+if [ -z "$JOB_ID" ]; then
+  # Get the latest job ID from scontrol
+  JOB_ID=$(oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job 2>/dev/null | grep JobId | head -1 | awk -F= '{print $2}' | awk '{print $1}')
+fi
+
+echo "Checking job $JOB_ID"
+oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job $JOB_ID
+
+# This should work for up to 1 hour after job completion (MinJobAge=3600)
+```
+
+### Test 7: View All Jobs in Memory
+
+**Objective**: See all completed jobs that are still retained in Slurm's memory.
+
+```bash
+# View all jobs currently in memory (up to MinJobAge duration)
+oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job
+
+# This will show all jobs with details like:
+# - JobId, JobState (COMPLETED, RUNNING, etc.)
+# - ExitCode (0:0 = success)
+# - NodeList (which compute node ran it: slinky-0 or slinky-1)
+# - StdOut (output file path)
+# - RunTime, StartTime, EndTime
+# - Resource allocation (ReqTRES, AllocTRES)
+
+# Filter for specific information
+oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job | grep -E "(JobId|JobState|ExitCode|NodeList|StdOut|RunTime)"
+
+# Count completed jobs
+oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job | grep "JobState=COMPLETED" | wc -l
+
+# See which nodes jobs ran on
+oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job | grep "NodeList=" | sort | uniq -c
+```
+
+**Example Output Analysis:**
+
+From the output, you can see:
+- **Job Distribution**: Jobs are distributed across both compute nodes (`slinky-0` and `slinky-1`)
+- **Job States**: All showing `JobState=COMPLETED` with `ExitCode=0:0` (success)
+- **Resource Usage**: Different jobs requested different resources:
+  - Job 8: Requested 2 CPUs (`ReqTRES=cpu=2`)
+  - Job 9: Requested 1 CPU and 2G memory (`ReqTRES=cpu=1,mem=2G`)
+- **Job Timing**: Various runtimes from seconds to minutes
+- **Output Files**: Each job has its output file path in `StdOut` field
+
+### Quick Test Script
+
+A ready-to-use test script is available: `scripts/test-slurm.sh`
+
+```bash
+# Run the test script
+./scripts/test-slurm.sh
+```
+
+This script will:
+1. Check cluster status
+2. Show available nodes
+3. Submit a test job
+4. Monitor job completion
+5. Display job status and output
+
+Make it executable and run:
+```bash
+chmod +x scripts/test-slurm.sh
+./scripts/test-slurm.sh
+```
+
+---
+
+## Monitoring and Observability
+
+### Check Operator Logs
+```bash
+oc logs -n openshift-operators -l app.kubernetes.io/name=slurm-operator --tail=100
+```
+
+### Check Controller Logs
+```bash
+oc logs -n slurm slurm-controller-0 -c slurmctld --tail=100
+```
+
+### Check Compute Node Logs
+```bash
+oc logs -n slurm slurm-worker-slinky-0 -c slurmd --tail=100
+```
+
+### Monitor Pod Status
+```bash
+# Watch pods in real-time
+oc get pods -n slurm -w
+
+# Check pod resource usage
+oc top pods -n slurm
+```
+
+### Check Compute Node Logs
+```bash
+oc logs -n slurm -l app.kubernetes.io/component=compute --tail=100
+```
+
+### Monitoring via UI
+
+1. **View Pod Logs**:
+   - Go to "Workloads" → "Pods"
+   - Click on pod name
+   - Click "Logs" tab
+
+2. **View Events**:
+   - Go to "Observe" → "Events"
+   - Filter by namespace: `slurm` or `slinky`
+
+3. **View Metrics**:
+   - Go to "Observe" → "Metrics"
+   - Select namespace: `slurm`
+   - View CPU, memory, and other metrics
+
+---
+
+## Quick Reference
+
+### Cleanup and Fresh Start
+
+**To delete everything and start fresh:**
+```bash
+# Clean up all Slurm resources
+./scripts/cleanup-slurm.sh slurm
+
+# Or manually:
+oc delete controller,nodeset --all -n slurm
+oc delete statefulset,deployment,pods,svc,pvc --all -n slurm
+oc delete secret slurm-auth-jwths256 slurm-auth-slurm -n slurm
+oc adm policy remove-scc-from-user anyuid -z default -n slurm
+oc delete namespace slurm
+```
+
+**To deploy from scratch:**
+```bash
+# Complete deployment in correct order
+./scripts/deploy-slurm.sh
+```
+
+
+## References
+
+- [Slurm Operator Installation Guide](https://slinky.schedmd.com/projects/slurm-operator/en/release-0.4/installation.html)
+- [Slurm Operator Configuration](https://slinky.schedmd.com/projects/slurm-operator/en/release-0.4/configuration.html)
+- [Slurm Documentation](https://slurm.schedmd.com/documentation.html)
+- [Slinky Project](https://slinky.schedmd.com/)
+
