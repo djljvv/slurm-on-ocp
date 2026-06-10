@@ -6,6 +6,7 @@ Complete guide for setting up and using Slurm workload manager on Red Hat OpenSh
 
 - **[Quick Start Guide](QUICK_START.md)** - Get Slurm on OpenShift running in a few steps
 - **[Deployment Guide](docs/DEPLOYMENT_GUIDE.md)** - Full deployment (CLI and UI)
+- **[DDP Test Guide](docs/DDP_TEST_GUIDE.md)** - Run distributed PyTorch training on Slurm (CPU & GPU)
 - **[Add Nodes](docs/ADD_NODES.md)** - Add physical/virtual/containerized nodes
 - **[Architecture Guide](docs/ARCHITECTURE.md)** - Slurm on OCP architecture
 
@@ -49,6 +50,14 @@ The [Deployment Guide](docs/DEPLOYMENT_GUIDE.md) includes:
 - **[Architecture](docs/ARCHITECTURE.md)** - How Slurm on OCP works (operator, controller, compute nodes)
 - **[Add Nodes](docs/ADD_NODES.md)** - Adding OpenShift, physical, or virtual nodes
 
+### DDP Test Guide
+
+The [DDP Test Guide](docs/DDP_TEST_GUIDE.md) covers:
+- Configuring GPU access for Slurm worker pods
+- Running distributed PyTorch training across Slurm-managed nodes
+- Validating NCCL/Gloo communication over the K8s network
+- Troubleshooting common issues
+
 ## Repository Structure
 
 ```
@@ -58,9 +67,14 @@ slurm-on-ocp/
 ├── configs/
 │   ├── slurm-cluster.yaml       # Controller + NodeSet (required): oc apply -f configs/slurm-cluster.yaml
 │   └── slurm-values.yaml        # Optional: only for Helm-based cluster deploy (helm install slurm ... -f this)
+├── demos/
+│   ├── ddp_test.py              # PyTorch DDP distributed training test
+│   └── submit_job.sh            # Slurm batch submission script for DDP test
 ├── docs/
 │   ├── DEPLOYMENT_GUIDE.md      # Step-by-step deployment (CLI and UI)
-│   ├── ADD_NODES.md            # Adding physical/virtual/containerized nodes
+│   ├── DDP_TEST_GUIDE.md        # Distributed training test guide (CPU & GPU)
+│   ├── PYTORCH_DEMO_CONCEPT.md  # Future ResNet-50 demo roadmap
+│   ├── ADD_NODES.md             # Adding physical/virtual/containerized nodes
 │   ├── ARCHITECTURE.md          # Slurm on OCP architecture
 │   └── SLURM_OPERATOR_READINESS.md
 └── scripts/
