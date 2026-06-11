@@ -102,8 +102,7 @@ else
   helm install slurm-operator-crds \
     oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
     --namespace slinky \
-    --create-namespace \
-    --server-side=false
+    --create-namespace
 
   # Wait a few seconds for CRDs to be registered
   sleep 10
@@ -112,6 +111,8 @@ fi
 # Verify CRDs are installed
 oc get crds | grep slurm
 ```
+
+**Troubleshooting:** If you get `Error: unknown flag: --server-side`, your Helm version doesn't support this flag — the command above already omits it. If you see older guides or scripts using `--server-side=false`, simply remove that flag.
 
 **Expected Output (Helm installs Slinky CRDs):**
 ```
@@ -123,27 +124,23 @@ nodesets.slinky.slurm.net
 ### Step 3: Install Slurm Operator
 
 ```bash
-# Check if operator is already installed (skip if already installed)
-if oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator &>/dev/null || \
-   oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator &>/dev/null; then
-  echo "Slurm Operator already installed, skipping..."
+# Check if operator is already installed AND running (must verify a Running pod exists)
+if oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running || \
+   oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running; then
+  echo "Slurm Operator already installed and running, skipping..."
 else
   # Install Slurm Operator
   helm install slurm-operator \
     oci://ghcr.io/slinkyproject/charts/slurm-operator \
     --namespace slinky \
     --create-namespace \
-    --server-side=false \
     --wait --timeout 5m
 fi
 
 # Verify operator is running (namespace depends on installation method)
-# Try OperatorHub first (most common), then Helm namespace
-oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator 2>/dev/null || \
-oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator
-
-# To uninstall an operator
-helm uninstall slurm-operator -n slinky
+# Check Helm namespace first, then OperatorHub namespace
+oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator 2>/dev/null || \
+oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator
 ```
 
 **Expected Output:**
@@ -151,6 +148,11 @@ helm uninstall slurm-operator -n slinky
 NAME                               READY   STATUS    RESTARTS   AGE
 slurm-operator-xxx                  1/1     Running   0          1m
 ```
+
+**Troubleshooting Step 3:**
+- **Operator shows "already installed" but no pods are Running** — The previous detection check may have been a false positive. Verify with: `oc get pods -n slinky` and `oc get pods -n openshift-operators | grep slurm`. If no Running pods exist, install the operator manually (run the `helm install` command above).
+- **`Error: unknown flag: --server-side`** — Remove `--server-side=false` from the command. The command above already omits it.
+- **To uninstall the operator later** (do NOT run this during installation): `helm uninstall slurm-operator -n slinky`
 
 ### Step 4: Deploy Slurm Cluster
 
@@ -174,6 +176,7 @@ This will:
 # 1. Create namespace and configure security
 oc create namespace slurm 2>/dev/null || true
 oc adm policy add-scc-to-user anyuid -z default -n slurm
+oc adm policy add-scc-to-user privileged -z default -n slurm
 
 # 2. Create secrets (operator default names/keys so UI template works without editing refs)
 JWT_KEY=$(openssl rand -base64 32)
@@ -201,16 +204,17 @@ SLURM_KEY=$(openssl rand -base64 32)
 oc create secret generic slurm-auth-jwths256 -n slurm --from-literal=jwt_hs256.key="$JWT_KEY"
 oc create secret generic slurm-auth-slurm -n slurm --from-literal=slurm.key="$SLURM_KEY"
 
-# Deploy with default settings (--server-side=false avoids metadata.managedFields errors)
+# Deploy with default settings
 helm upgrade --install slurm \
   oci://ghcr.io/slinkyproject/charts/slurm \
   --namespace slurm \
   --create-namespace \
-  --server-side=false \
   --wait --timeout 10m
 ```
 
 **Note:** The Helm chart typically creates a Controller whose name matches the release (e.g. `slurm`). Use `oc get controllers -n slurm` to see the exact name; then e.g. `oc describe controller slurm -n slurm`.
+
+**If using a custom values file (`slurm-values.yaml`):** Verify it does not set `runAsNonRoot: true` in the security context — `slurmd` worker pods require `privileged` access and will fail to start with this setting.
 
 **If you get version mismatch or "no matches for kind Controller" errors:**
 - Check the CRD supports v1beta1: `oc get crd controllers.slinky.slurm.net -o jsonpath='{.spec.versions[*].name}'`
@@ -225,8 +229,7 @@ oc get pods -n slurm
 
 # Check Controller and NodeSet resources (not SlurmCluster - that's the old API)
 oc get controllers,nodesets -n slurm
-# Use the controller name from the list above (e.g. slurm)
-oc describe controller <controller-name> -n slurm
+oc describe controller slurm -n slurm
 
 # Check services
 oc get svc -n slurm
@@ -235,10 +238,20 @@ oc get svc -n slurm
 **Expected Output:**
 ```
 NAME                          READY   STATUS    RESTARTS   AGE
-slurm-controller-xxx          1/1     Running   0          2m
-slurm-worker-slinky-0         1/1     Running   0          2m
-slurm-worker-slinky-1         1/1     Running   0          2m
+slurm-controller-0            3/3     Running   0          2m
+slurm-worker-slinky-0         2/2     Running   0          2m
+slurm-worker-slinky-1         2/2     Running   0          2m
 ```
+
+> **Note on READY counts:** The controller pod shows `3/3` because it has sidecar containers (slurmctld, reconfigure, logfile). Worker pods show `2/2` (slurmd + logfile sidecar). If you see `1/1`, you may be running a minimal configuration without sidecars — this is also fine.
+
+**Troubleshooting Step 5:**
+- **Pods stuck in `Pending`** — Check if the `privileged` SCC was applied: `oc get pods -n slurm -o wide` and `oc describe pod <pod-name> -n slurm | grep -A5 Events`. If you see SCC-related errors, apply it: `oc adm policy add-scc-to-user privileged -z default -n slurm`
+- **Worker pods not appearing after SCC fix** — The operator may need a nudge to reconcile. Force it by annotating the NodeSet:
+  ```bash
+  oc annotate nodeset slurm-worker-slinky -n slurm reconcile=$(date +%s) --overwrite
+  ```
+- **Pods in `Init:0/2` or `Init:CrashLoopBackOff`** — Init containers may be waiting for dependencies. Check init container logs: `oc logs <pod-name> -n slurm -c <init-container-name> --previous`
 
 ### Step 6: Test Slurm Cluster
 
@@ -377,10 +390,10 @@ fi
 # Verify CRDs are installed
 oc get crds | grep slurm
 
-# Check if operator is already installed (skip if already installed)
-if oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator &>/dev/null || \
-   oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator &>/dev/null; then
-  echo "Slurm Operator already installed, skipping..."
+# Check if operator is already installed AND running (must verify a Running pod exists)
+if oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running || \
+   oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running; then
+  echo "Slurm Operator already installed and running, skipping..."
 else
   # Install Slurm Operator
   helm install slurm-operator \
@@ -409,17 +422,25 @@ Do NOT use "Create Deployment" page - it only accepts Deployment resources. Use 
 # Create namespace
 oc create namespace slurm
 
-# Grant anyuid SCC to the namespace's default service account
-# This allows pods to run with the UID required by Slurm (401)
+# Grant anyuid SCC (allows pods to run with the UID required by Slurm - UID 401)
 oc adm policy add-scc-to-user anyuid -z default -n slurm
+
+# Grant privileged SCC (required for slurmd worker pods)
+oc adm policy add-scc-to-user privileged -z default -n slurm
 ```
+
+> **Why both SCCs?** `anyuid` allows the controller pod to run as UID 401 (required by Slurm). `privileged` is required by `slurmd` worker pods — without it, workers will fail with: `pods "slurm-worker-slinky-0" is forbidden: unable to validate against any security context constraint`.
 
 **Via UI:**
 - Go to "Home" → "Projects"
 - Click "Create Project"
 - Name: `slurm`
 - Click "Create"
-- **Then via terminal**, grant SCC: `oc adm policy add-scc-to-user anyuid -z default -n slurm`
+- **Then via terminal**, grant both SCCs:
+  ```bash
+  oc adm policy add-scc-to-user anyuid -z default -n slurm
+  oc adm policy add-scc-to-user privileged -z default -n slurm
+  ```
 
 #### Step 3.2: Create Required Secrets (SECOND STEP)
 
@@ -823,6 +844,9 @@ oc create namespace slurm
 # Grant anyuid SCC to allow Slurm to run with required UID (401)
 oc adm policy add-scc-to-user anyuid -z default -n slurm
 
+# Grant privileged SCC (required for slurmd worker pods)
+oc adm policy add-scc-to-user privileged -z default -n slurm
+
 # Step 2: Create required secrets (operator default names/keys)
 JWT_KEY=$(openssl rand -base64 32)
 SLURM_KEY=$(openssl rand -base64 32)
@@ -1030,6 +1054,23 @@ oc exec -n slurm slurm-worker-slinky-1 -c slurmd -- cat /tmp/test-job.out
 # Job completed successfully
 ```
 
+**Troubleshooting Test 1:**
+
+- **`event not found` error when using `!` in `sbatch --wrap`** — Bash interprets `!` inside double quotes as history expansion. Use single quotes instead:
+  ```bash
+  # WRONG (will fail with "event not found"):
+  oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch --wrap="echo 'Hello!' && hostname"
+
+  # CORRECT (use single quotes or avoid ! in double quotes):
+  oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch --wrap='echo Hello && hostname && date'
+  ```
+- **`sacct` returns "Slurm accounting storage is disabled"** — `sacct` requires `slurmdbd` (Slurm Database Daemon), which is **not deployed by default**. Use `scontrol show job <JOB_ID>` instead to check job status. Jobs remain visible via `scontrol` for the duration set by `MinJobAge` (default: 300 seconds, set to 3600 in this guide).
+- **Job output file not found** — Remember that job output files are written **on the worker node** that ran the job, not on the controller. Always check which node ran the job first with `scontrol show job <JOB_ID> | grep NodeList`.
+- **`--export=ALL` for environment propagation** — If your job script relies on environment variables from the submitting shell, add `--export=ALL` to the `sbatch` command:
+  ```bash
+  oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch --export=ALL --output=/tmp/test.out --wrap="env | head -20"
+  ```
+
 ### Test 2: Multiple Jobs and Queue Monitoring
 
 **Objective**: Submit multiple jobs and monitor the queue.
@@ -1201,7 +1242,15 @@ chmod +x scripts/test-slurm.sh
 
 ### Check Operator Logs
 ```bash
+# If operator was installed via Helm (in slinky namespace):
+oc logs -n slinky -l app.kubernetes.io/name=slurm-operator --tail=100
+
+# If operator was installed via OperatorHub (in openshift-operators namespace):
 oc logs -n openshift-operators -l app.kubernetes.io/name=slurm-operator --tail=100
+
+# Not sure which namespace? Check both:
+oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator 2>/dev/null || \
+oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator
 ```
 
 ### Check Controller Logs
@@ -1260,6 +1309,7 @@ oc delete controller,nodeset --all -n slurm
 oc delete statefulset,deployment,pods,svc,pvc --all -n slurm
 oc delete secret slurm-auth-jwths256 slurm-auth-slurm -n slurm
 oc adm policy remove-scc-from-user anyuid -z default -n slurm
+oc adm policy remove-scc-from-user privileged -z default -n slurm
 oc delete namespace slurm
 ```
 

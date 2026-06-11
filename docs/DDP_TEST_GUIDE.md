@@ -526,3 +526,54 @@ Once this test passes, you've validated the core infrastructure. Next steps towa
 5. **Multi-node scaling test** — Add more worker nodes and measure linear scaling efficiency
 
 See [PyTorch Demo Concept](PYTORCH_DEMO_CONCEPT.md) for the full roadmap.
+
+---
+
+## How the Test Works
+
+### `submit_job.sh` — Launching the Job
+
+The batch script requests 2 nodes with gang scheduling (`--nodes=2`), one task per node, and a 15-minute time limit. Before launching the Python script, it derives the master address from Slurm's node list:
+
+```bash
+export MASTER_ADDR=$(scontrol show hostname $SLURM_NODELIST | head -n1)
+export MASTER_PORT=29500
+export WORLD_SIZE=$SLURM_NTASKS
+```
+
+`srun` then launches one copy of `ddp_test.py` per node, with Slurm injecting `SLURM_PROCID`, `SLURM_NTASKS`, `SLURM_NODELIST`, and `SLURM_LOCALID` into each process.
+
+### `ddp_test.py` — Script Internals
+
+**Setup:** The script auto-detects its launch mode — Slurm (via `SLURM_PROCID`), torchrun (via `RANK`), or single-process fallback. It picks NCCL for GPU or Gloo for CPU, then calls `dist.init_process_group()` to connect all ranks through `MASTER_ADDR:MASTER_PORT`.
+
+**Phase 1 — Communication Test:** Each rank creates a tensor containing its rank value. An `all_reduce(SUM)` should produce `N*(N-1)/2`. If it doesn't match, the script aborts — no point continuing if basic communication is broken.
+
+**Phase 2 — Bandwidth Test:** A 32 MB `all_reduce` is timed to measure inter-pod throughput. Typical result is ~0.5 GB/s over K8s SDN, which is 10–50x slower than InfiniBand but adequate for compute-bound workloads.
+
+**Phase 3 — Training:** A small CNN (~1.2M parameters) trains on synthetic 3x32x32 images (8,192 samples) using DDP. A `DistributedSampler` shards data across ranks. DDP hooks into the backward pass to `all_reduce` gradients before each optimizer step, keeping weights identical across ranks. Decreasing loss across epochs proves gradient sync is correct.
+
+CLI args: `--epochs` (default 5), `--batch-size` (default 64), `--num-samples` (default 8192).
+
+---
+
+## Why This Test Matters
+
+The DDP test validates the core value proposition of Slurm on OpenShift: multi-node distributed training that pure Kubernetes cannot do without significant workarounds.
+
+### What Kubernetes Alone Cannot Do
+
+| Capability | Pure K8s | Slurm on OCP |
+|------------|----------|--------------|
+| Gang scheduling | Pods start independently, risking deadlock | `sbatch -N 2` guarantees all-or-nothing |
+| Job queue with fairshare | No built-in queueing | Native `squeue`, priority, backfill |
+| Multi-node coordination | Manual StatefulSet + DNS setup | Automatic `$SLURM_*` env vars |
+| Batch job accounting | Custom Prometheus exporters | Native `sacct` with runtime, memory, exit codes |
+| User experience | Write YAML manifests | `sbatch job.sh` |
+
+### Roadmap After Test Success
+
+1. **Custom container images** — Build a PyTorch image with all dependencies pre-installed to eliminate runtime `pip install` and ensure reproducibility.
+2. **Real ML workloads** — Move from the small CNN to ResNet-50 on Tiny-ImageNet with FSDP, or 3D U-Net for medical imaging (see [PyTorch Demo Concept](PYTORCH_DEMO_CONCEPT.md)).
+3. **Hybrid cloud** — Add bare-metal GPU nodes to the Slurm cluster so jobs can burst beyond OpenShift using the same `sbatch` scripts (see [Add Nodes Guide](ADD_NODES.md)).
+4. **Multi-tenancy** — Configure Slurm accounts, QoS policies, and fairshare scheduling for shared environments with `sacct`-based chargeback.
