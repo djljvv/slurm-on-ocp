@@ -73,10 +73,8 @@ slurm-on-ocp/
 ├── docs/
 │   ├── DEPLOYMENT_GUIDE.md      # Step-by-step deployment (CLI and UI)
 │   ├── DDP_TEST_GUIDE.md        # Distributed training test guide (CPU & GPU)
-│   ├── PYTORCH_DEMO_CONCEPT.md  # Future ResNet-50 demo roadmap
 │   ├── ADD_NODES.md             # Adding physical/virtual/containerized nodes
-│   ├── ARCHITECTURE.md          # Slurm on OCP architecture
-│   └── SLURM_OPERATOR_READINESS.md
+│   └── ARCHITECTURE.md          # Slurm on OCP architecture
 └── scripts/
     ├── deploy-slurm.sh          # Deploy Slurm (operator + cluster)
     ├── cleanup-slurm.sh         # Remove Slurm resources

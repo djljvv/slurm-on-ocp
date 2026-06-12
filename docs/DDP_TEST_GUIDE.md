@@ -525,7 +525,7 @@ Once this test passes, you've validated the core infrastructure. Next steps towa
 4. **Custom container image** — Build a PyTorch image with all dependencies pre-installed (no runtime `pip install`)
 5. **Multi-node scaling test** — Add more worker nodes and measure linear scaling efficiency
 
-See [PyTorch Demo Concept](PYTORCH_DEMO_CONCEPT.md) for the full roadmap.
+See the **Roadmap After Test Success** section below for next steps.
 
 ---
 
@@ -574,6 +574,6 @@ The DDP test validates the core value proposition of Slurm on OpenShift: multi-n
 ### Roadmap After Test Success
 
 1. **Custom container images** — Build a PyTorch image with all dependencies pre-installed to eliminate runtime `pip install` and ensure reproducibility.
-2. **Real ML workloads** — Move from the small CNN to ResNet-50 on Tiny-ImageNet with FSDP, or 3D U-Net for medical imaging (see [PyTorch Demo Concept](PYTORCH_DEMO_CONCEPT.md)).
+2. **Real ML workloads** — Move from the small CNN to ResNet-50 on Tiny-ImageNet with FSDP, or 3D U-Net for medical imaging.
 3. **Hybrid cloud** — Add bare-metal GPU nodes to the Slurm cluster so jobs can burst beyond OpenShift using the same `sbatch` scripts (see [Add Nodes Guide](ADD_NODES.md)).
 4. **Multi-tenancy** — Configure Slurm accounts, QoS policies, and fairshare scheduling for shared environments with `sacct`-based chargeback.
