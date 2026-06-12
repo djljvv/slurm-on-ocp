@@ -1,0 +1,151 @@
+# Slurm NodeSet Autoscaling via KEDA
+#
+# Autoscales the Slurm worker NodeSet based on pending job demand.
+# The Slinky operator handles pod lifecycle (drain before scale-in, etc.).
+#
+# Prerequisites:
+#   1. Prometheus (scraping Slurm REST API metrics)
+#   2. KEDA (Kubernetes Event-Driven Autoscaling)
+#   3. Slurm REST API deployed (exposes slurm_partition_* metrics)
+#
+# Install prerequisites:
+#   # Prometheus (via kube-prometheus-stack or OpenShift monitoring)
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm install prometheus prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
+#
+#   # KEDA
+#   helm repo add kedacore https://kedacore.github.io/charts
+#   helm install keda kedacore/keda -n keda --create-namespace
+#
+# Deploy:
+#   oc apply -f configs/slurm-autoscaler.yaml
+
+---
+# Slurm REST API - exposes Slurm metrics to Prometheus
+# The operator creates a slurmrestd pod that serves the Slurm REST API,
+# which Prometheus scrapes for partition/job/node metrics.
+apiVersion: slinky.slurm.net/v1beta1
+kind: RestAPI
+metadata:
+  name: slurm
+  namespace: slurm
+spec:
+  controllerRef:
+    name: slurm
+    namespace: slurm
+  slurmrestd:
+    image: 'ghcr.io/slinkyproject/slurmrestd:25.11-ubuntu24.04'
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+
+---
+# ServiceMonitor - tells Prometheus to scrape the Slurm REST API
+# (Only needed if using Prometheus Operator / kube-prometheus-stack)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: slurm-metrics
+  namespace: slurm
+  labels:
+    app.kubernetes.io/part-of: slurm
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: slurmrestd
+  endpoints:
+    - port: http
+      interval: 15s
+      path: /metrics
+
+---
+# KEDA ScaledObject - autoscales the NodeSet based on pending jobs
+#
+# How it works:
+#   - When pending jobs > 0, KEDA scales NodeSet to minReplicaCount
+#   - HPA then scales up toward maxReplicaCount as pending jobs exceed threshold
+#   - When no pending jobs for cooldownPeriod, KEDA scales to idleReplicaCount
+#   - The Slinky operator gracefully drains nodes before terminating pods
+#
+# Scaling behavior:
+#   0 pending jobs (idle for 5m) -> idleReplicaCount (1 node standing by)
+#   1+ pending jobs              -> minReplicaCount (2 nodes minimum)
+#   pending jobs > threshold     -> HPA scales toward maxReplicaCount
+#   No pending jobs again        -> cooldown, then back to idle
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: scale-slurm-workers
+  namespace: slurm
+spec:
+  scaleTargetRef:
+    apiVersion: slinky.slurm.net/v1beta1
+    kind: NodeSet
+    name: slurm-worker-slinky
+  idleReplicaCount: 1
+  minReplicaCount: 2
+  maxReplicaCount: 8
+  cooldownPeriod: 300
+  pollingInterval: 15
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 120
+  triggers:
+    # Scale based on pending jobs in the partition
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+        query: slurm_partition_jobs_pending{partition="all"}
+        threshold: "1"
+        activationThreshold: "0"
+
+    # Scale based on the largest pending job's node count requirement
+    # Ensures enough nodes exist for the biggest waiting job
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+        query: slurm_partition_jobs_pending_max_nodes{partition="all"}
+        threshold: "2"
+        activationThreshold: "0"
+
+---
+# (Optional) Additional ScaledObject for GPU partition autoscaling
+# Uncomment and customize if you have a separate GPU NodeSet
+#
+# apiVersion: keda.sh/v1alpha1
+# kind: ScaledObject
+# metadata:
+#   name: scale-slurm-gpu-workers
+#   namespace: slurm
+# spec:
+#   scaleTargetRef:
+#     apiVersion: slinky.slurm.net/v1beta1
+#     kind: NodeSet
+#     name: slurm-worker-gpu
+#   idleReplicaCount: 0
+#   minReplicaCount: 1
+#   maxReplicaCount: 4
+#   cooldownPeriod: 600
+#   pollingInterval: 15
+#   triggers:
+#     - type: prometheus
+#       metadata:
+#         serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
+#         query: slurm_partition_jobs_pending{partition="gpu"}
+#         threshold: "1"

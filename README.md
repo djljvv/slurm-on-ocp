@@ -56,6 +56,7 @@ The [DDP Test Guide](docs/DDP_TEST_GUIDE.md) covers:
 - Configuring GPU access for Slurm worker pods
 - Running distributed PyTorch training across Slurm-managed nodes
 - Validating NCCL/Gloo communication over the K8s network
+- Autoscaling with KEDA — elastic job submission and NodeSet scaling based on demand
 - Troubleshooting common issues
 
 ## Repository Structure
@@ -66,10 +67,12 @@ slurm-on-ocp/
 ├── QUICK_START.md               # Quick setup guide
 ├── configs/
 │   ├── slurm-cluster.yaml       # Controller + NodeSet (required): oc apply -f configs/slurm-cluster.yaml
+│   ├── slurm-autoscaler.yaml    # KEDA ScaledObject + Slurm REST API for autoscaling
 │   └── slurm-values.yaml        # Optional: only for Helm-based cluster deploy (helm install slurm ... -f this)
 ├── demos/
-│   ├── ddp_test.py              # PyTorch DDP distributed training test
-│   └── submit_job.sh            # Slurm batch submission script for DDP test
+│   ├── ddp_test.py              # PyTorch DDP distributed training test (supports --autoscale)
+│   ├── submit_job.sh            # Slurm batch submission script (fixed nodes)
+│   └── submit_job_autoscale.sh  # Elastic submission script (--nodes=min-max, --requeue)
 ├── docs/
 │   ├── DEPLOYMENT_GUIDE.md      # Step-by-step deployment (CLI and UI)
 │   ├── DDP_TEST_GUIDE.md        # Distributed training test guide (CPU & GPU)

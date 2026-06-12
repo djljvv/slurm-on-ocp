@@ -18,7 +18,9 @@ This guide walks through running a **distributed PyTorch training test** on Slur
 | File | Purpose |
 |------|---------|
 | `demos/ddp_test.py` | PyTorch DDP training script (torchrun + Slurm compatible) |
-| `demos/submit_job.sh` | Slurm batch submission script |
+| `demos/submit_job.sh` | Slurm batch submission script (fixed node count) |
+| `demos/submit_job_autoscale.sh` | Elastic submission script (variable node count, `--nodes=min-max`) |
+| `configs/slurm-autoscaler.yaml` | KEDA ScaledObject + Slurm REST API for NodeSet autoscaling |
 
 ---
 
@@ -515,6 +517,224 @@ Output is written to the **batch host** node (the first node in the allocation).
 
 ---
 
+## Autoscaling
+
+The DDP test supports autoscaling at two levels: **cluster-level** (Slinky/KEDA scales the NodeSet based on job demand) and **job-level** (Slurm allocates a variable number of nodes per job). Together, these allow the cluster to expand when workloads arrive and contract when idle.
+
+### Architecture
+
+```
+                         ┌──────────────┐
+                         │  User submits│
+                         │  sbatch job  │
+                         └──────┬───────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Slurm Controller                                           │
+│  - Sees pending job, needs N nodes                          │
+│  - Elastic: --nodes=1-4 allows partial starts               │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+          ┌────────────┼────────────────┐
+          ▼            ▼                ▼
+   ┌────────────┐ ┌────────────┐  ┌────────────┐
+   │ Prometheus │ │   KEDA     │  │  Slinky    │
+   │ scrapes    │→│ ScaledObj  │→ │  Operator  │
+   │ slurm_*    │ │ threshold  │  │  scales    │
+   │ metrics    │ │ triggers   │  │  NodeSet   │
+   └────────────┘ └────────────┘  └────────────┘
+                                        │
+                       ┌────────────────┼──────────────┐
+                       ▼                ▼              ▼
+                ┌──────────┐     ┌──────────┐   ┌──────────┐
+                │ Worker 0 │     │ Worker 1 │   │ Worker N │
+                │ (slurmd) │     │ (slurmd) │   │ (scaled) │
+                └──────────┘     └──────────┘   └──────────┘
+```
+
+### Prerequisites
+
+Autoscaling requires three additional components beyond the base Slurm/Slinky deployment:
+
+1. **Prometheus** — scrapes Slurm REST API metrics (`slurm_partition_jobs_pending`, etc.)
+2. **KEDA** — bridges Prometheus metrics to Kubernetes HPA, supports scale-to-zero
+3. **Slurm REST API** — exposes Slurm metrics (deployed via `configs/slurm-autoscaler.yaml`)
+
+### Step 1: Install Prometheus and KEDA
+
+```bash
+# Prometheus (skip if OpenShift monitoring is already enabled)
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install prometheus prometheus-community/kube-prometheus-stack \
+  -n monitoring --create-namespace
+
+# KEDA
+helm repo add kedacore https://kedacore.github.io/charts
+helm install keda kedacore/keda -n keda --create-namespace
+
+# Verify both are running
+oc get pods -n monitoring | grep prometheus
+oc get pods -n keda | grep keda
+```
+
+### Step 2: Deploy the Autoscaler
+
+```bash
+# Deploys: Slurm REST API + ServiceMonitor + KEDA ScaledObject
+oc apply -f configs/slurm-autoscaler.yaml
+
+# Verify the REST API pod is running
+oc get pods -n slurm -l app.kubernetes.io/name=slurmrestd
+
+# Verify KEDA created the HPA
+oc get hpa -n slurm
+# Expected: keda-hpa-scale-slurm-workers targeting NodeSet
+```
+
+The default autoscaler configuration:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `idleReplicaCount` | 1 | Standby nodes when no jobs are pending |
+| `minReplicaCount` | 2 | Minimum nodes when jobs are active |
+| `maxReplicaCount` | 8 | Maximum nodes under heavy demand |
+| `cooldownPeriod` | 300s | Seconds of inactivity before scaling to idle |
+| `pollingInterval` | 15s | How often KEDA checks Prometheus |
+
+Edit `configs/slurm-autoscaler.yaml` to adjust these values for your cluster.
+
+### Step 3: Submit an Elastic Job
+
+The elastic submit script uses `--nodes=min-max` so Slurm starts the job as soon as the minimum node count is available, rather than waiting for the maximum:
+
+```bash
+# Copy elastic submit script to controller
+oc cp demos/submit_job_autoscale.sh slurm/slurm-controller-0:/tmp/submit_job_autoscale.sh -c slurmctld
+
+# Copy training script to ALL workers (including any that may scale up)
+# For a static 2-node test:
+oc cp demos/ddp_test.py slurm/slurm-worker-slinky-0:/tmp/ddp_test.py -c slurmd
+oc cp demos/ddp_test.py slurm/slurm-worker-slinky-1:/tmp/ddp_test.py -c slurmd
+
+# Submit the elastic job
+oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch /tmp/submit_job_autoscale.sh
+```
+
+Key differences from `submit_job.sh`:
+
+| Feature | `submit_job.sh` | `submit_job_autoscale.sh` |
+|---------|----------------|--------------------------|
+| Node count | `--nodes=2` (fixed) | `--nodes=1-4` (elastic range) |
+| Preemption | None | `--requeue` (re-enqueue on preemption) |
+| Backfill | No | `--time-min` enables backfill scheduling |
+| Metrics | Standard output | `--autoscale` flag adds scaling report |
+
+**Override the node range at submission time:**
+
+```bash
+# Run with 2-8 nodes
+oc exec -n slurm slurm-controller-0 -c slurmctld -- \
+  sbatch --nodes=2-8 /tmp/submit_job_autoscale.sh
+
+# Run on GPU partition with autoscaling
+oc exec -n slurm slurm-controller-0 -c slurmctld -- \
+  sbatch --nodes=1-4 --gres=gpu:1 --partition=gpu /tmp/submit_job_autoscale.sh
+```
+
+### Step 4: Monitor Autoscaling Behavior
+
+```bash
+# Watch NodeSet replica count change in real time
+oc get nodeset slurm-worker-slinky -n slurm -w
+
+# Watch pods scale up/down
+oc get pods -n slurm -l nodeset.slinky.slurm.net/name=slurm-worker-slinky -w
+
+# Check KEDA ScaledObject status
+oc describe scaledobject scale-slurm-workers -n slurm
+
+# Check HPA scaling decisions
+oc describe hpa -n slurm
+
+# View Slurm's perspective on node states
+oc exec -n slurm slurm-controller-0 -c slurmctld -- sinfo -N -l
+```
+
+### Step 5: View Autoscaling Report
+
+When `--autoscale` is passed to `ddp_test.py`, the job output includes a scaling efficiency report after training completes:
+
+```
+============================================================
+  Autoscaling Report
+============================================================
+  Current world size:     4
+  Per-rank throughput:    38 samples/s
+  Global throughput:      152 samples/s
+  Scaling efficiency:     95.2%
+  Slurm job:              42
+  Node range:             1-4
+  Recommendation:         SCALE UP  - High efficiency, adding nodes would increase throughput
+  Host memory usage:      34.2%
+============================================================
+
+[Autoscale] Metrics written to /tmp/ddp-autoscale-metrics.json
+```
+
+The report also writes a machine-readable JSON metrics file (`/tmp/ddp-autoscale-metrics.json`) that external tools can consume.
+
+### Autoscaling Scenarios
+
+**Scenario 1: Burst of jobs**
+1. User submits 5 DDP jobs with `sbatch submit_job_autoscale.sh`
+2. Prometheus reports `slurm_partition_jobs_pending = 5`
+3. KEDA scales NodeSet from idle (1) to max (8) over ~60s
+4. Slurm scheduler assigns nodes to jobs as they become available
+5. Jobs complete, pending count drops to 0
+6. After 5 minutes of no pending jobs, KEDA scales back to idle (1)
+
+**Scenario 2: Single elastic job**
+1. User submits `sbatch --nodes=2-8 submit_job_autoscale.sh`
+2. Only 3 nodes are currently available — Slurm starts the job with 3 nodes
+3. KEDA sees the pending node demand and scales up the NodeSet
+4. Slurm cannot dynamically add nodes mid-job (elastic allocation is at submit time), but the next job benefits from the expanded pool
+
+**Scenario 3: Priority preemption**
+1. A low-priority job is running on 4 nodes
+2. A high-priority job is submitted needing 4 nodes
+3. Slurm preempts the low-priority job (`--requeue` causes it to re-enter the queue)
+4. KEDA detects pending jobs and scales up for both to run
+
+### Customizing the Autoscaler
+
+**Change the Prometheus query** to target specific partitions or use different metrics:
+
+```yaml
+# Scale based on CPU-seconds of pending work (more nuanced than job count)
+triggers:
+  - type: prometheus
+    metadata:
+      query: slurm_partition_cpus_pending{partition="all"}
+      threshold: "4"
+```
+
+**Add a separate GPU autoscaler** — uncomment the optional ScaledObject in `configs/slurm-autoscaler.yaml` and adjust for your GPU NodeSet name and partition.
+
+**Scale to zero** — set `idleReplicaCount: 0` in the ScaledObject to completely remove worker pods when no jobs are pending. KEDA handles the 0-to-1 transition when a new job arrives.
+
+### Disabling Autoscaling
+
+```bash
+# Remove the autoscaler (keeps static NodeSet replicas)
+oc delete -f configs/slurm-autoscaler.yaml
+
+# Set a fixed replica count
+oc scale nodeset slurm-worker-slinky --replicas=2 -n slurm
+```
+
+---
+
 ## Next Steps
 
 Once this test passes, you've validated the core infrastructure. Next steps toward production GPU workloads:
@@ -524,6 +744,7 @@ Once this test passes, you've validated the core infrastructure. Next steps towa
 3. **Real dataset** — Replace synthetic data with Tiny-ImageNet or domain-specific data
 4. **Custom container image** — Build a PyTorch image with all dependencies pre-installed (no runtime `pip install`)
 5. **Multi-node scaling test** — Add more worker nodes and measure linear scaling efficiency
+6. **Autoscaled workloads** — Deploy the KEDA autoscaler (`configs/slurm-autoscaler.yaml`) and use elastic job submission to let the cluster scale with demand
 
 See the **Roadmap After Test Success** section below for next steps.
 
@@ -553,7 +774,13 @@ export WORLD_SIZE=$SLURM_NTASKS
 
 **Phase 3 — Training:** A small CNN (~1.2M parameters) trains on synthetic 3x32x32 images (8,192 samples) using DDP. A `DistributedSampler` shards data across ranks. DDP hooks into the backward pass to `all_reduce` gradients before each optimizer step, keeping weights identical across ranks. Decreasing loss across epochs proves gradient sync is correct.
 
-CLI args: `--epochs` (default 5), `--batch-size` (default 64), `--num-samples` (default 8192).
+**Phase 4 — Autoscaling Report (optional):** When `--autoscale` is passed, the script collects per-rank resource utilization (GPU memory, host memory, CPU count) and computes scaling efficiency metrics. It compares per-rank throughput across epochs to determine whether adding or removing nodes would improve overall performance. Results are printed and also written to `/tmp/ddp-autoscale-metrics.json` for consumption by external tooling.
+
+CLI args: `--epochs` (default 5), `--batch-size` (default 64), `--num-samples` (default 8192), `--autoscale` (enable scaling report).
+
+### `submit_job_autoscale.sh` — Elastic Job Submission
+
+The elastic variant uses `--nodes=1-4` (min-max syntax) so Slurm can start the job as soon as the minimum node count is available. This pairs with KEDA-driven NodeSet autoscaling: when the job is pending, KEDA detects `slurm_partition_jobs_pending > 0` and scales up the NodeSet. The `--requeue` flag allows Slurm to re-enqueue the job if it's preempted by higher-priority work, and `--time-min` enables backfill scheduling.
 
 ---
 
