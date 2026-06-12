@@ -102,7 +102,8 @@ else
   helm install slurm-operator-crds \
     oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
     --namespace slinky \
-    --create-namespace
+    --create-namespace \
+    --server-side=false
 
   # Wait a few seconds for CRDs to be registered
   sleep 10
@@ -112,7 +113,7 @@ fi
 oc get crds | grep slurm
 ```
 
-**Troubleshooting:** If you get `Error: unknown flag: --server-side`, your Helm version doesn't support this flag — the command above already omits it. If you see older guides or scripts using `--server-side=false`, simply remove that flag.
+**Troubleshooting:** If you get `Error: unknown flag: --server-side`, your Helm version (< 3.12) doesn't support this flag — simply remove `--server-side=false` from the command.
 
 **Expected Output (Helm installs Slinky CRDs):**
 ```
@@ -134,13 +135,14 @@ else
     oci://ghcr.io/slinkyproject/charts/slurm-operator \
     --namespace slinky \
     --create-namespace \
+    --server-side=false \
     --wait --timeout 5m
 fi
 
 # Verify operator is running (namespace depends on installation method)
-# Check Helm namespace first, then OperatorHub namespace
-oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator 2>/dev/null || \
-oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator
+# Try OperatorHub first (most common), then Helm namespace
+oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator 2>/dev/null || \
+oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator
 ```
 
 **Expected Output:**
@@ -149,9 +151,9 @@ NAME                               READY   STATUS    RESTARTS   AGE
 slurm-operator-xxx                  1/1     Running   0          1m
 ```
 
-**Troubleshooting Step 3:**
+**Troubleshooting:**
 - **Operator shows "already installed" but no pods are Running** — The previous detection check may have been a false positive. Verify with: `oc get pods -n slinky` and `oc get pods -n openshift-operators | grep slurm`. If no Running pods exist, install the operator manually (run the `helm install` command above).
-- **`Error: unknown flag: --server-side`** — Remove `--server-side=false` from the command. The command above already omits it.
+- **`Error: unknown flag: --server-side`** — Your Helm version (< 3.12) doesn't support this flag. Remove `--server-side=false` from the command.
 - **To uninstall the operator later** (do NOT run this during installation): `helm uninstall slurm-operator -n slinky`
 
 ### Step 4: Deploy Slurm Cluster
@@ -204,11 +206,12 @@ SLURM_KEY=$(openssl rand -base64 32)
 oc create secret generic slurm-auth-jwths256 -n slurm --from-literal=jwt_hs256.key="$JWT_KEY"
 oc create secret generic slurm-auth-slurm -n slurm --from-literal=slurm.key="$SLURM_KEY"
 
-# Deploy with default settings
+# Deploy with default settings (--server-side=false avoids metadata.managedFields errors)
 helm upgrade --install slurm \
   oci://ghcr.io/slinkyproject/charts/slurm \
   --namespace slurm \
   --create-namespace \
+  --server-side=false \
   --wait --timeout 10m
 ```
 
@@ -229,7 +232,8 @@ oc get pods -n slurm
 
 # Check Controller and NodeSet resources (not SlurmCluster - that's the old API)
 oc get controllers,nodesets -n slurm
-oc describe controller slurm -n slurm
+# Use the controller name from the list above (e.g. slurm)
+oc describe controller <controller-name> -n slurm
 
 # Check services
 oc get svc -n slurm
@@ -381,7 +385,8 @@ else
   helm install slurm-operator-crds \
     oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
     --namespace slinky \
-    --create-namespace
+    --create-namespace \
+    --server-side=false
 
   # Wait a few seconds for CRDs to be registered
   sleep 10
@@ -400,6 +405,7 @@ else
     oci://ghcr.io/slinkyproject/charts/slurm-operator \
     --namespace slinky \
     --create-namespace \
+    --server-side=false \
     --wait --timeout 5m
 fi
 ```
