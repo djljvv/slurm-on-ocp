@@ -1,151 +1,134 @@
-# Slurm NodeSet Autoscaling via KEDA
+# Slurm NodeSet Autoscaler — Direct Polling with Auto-Provisioning
 #
-# Autoscales the Slurm worker NodeSet based on pending job demand.
-# The Slinky operator handles pod lifecycle (drain before scale-in, etc.).
-#
-# Prerequisites:
-#   1. Prometheus (scraping Slurm REST API metrics)
-#   2. KEDA (Kubernetes Event-Driven Autoscaling)
-#   3. Slurm REST API deployed (exposes slurm_partition_* metrics)
-#
-# Install prerequisites:
-#   # Prometheus (via kube-prometheus-stack or OpenShift monitoring)
-#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-#   helm install prometheus prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
-#
-#   # KEDA
-#   helm repo add kedacore https://kedacore.github.io/charts
-#   helm install keda kedacore/keda -n keda --create-namespace
-#
-# Deploy:
-#   oc apply -f configs/slurm-autoscaler.yaml
-
----
-# Slurm REST API - exposes Slurm metrics to Prometheus
-# The operator creates a slurmrestd pod that serves the Slurm REST API,
-# which Prometheus scrapes for partition/job/node metrics.
-apiVersion: slinky.slurm.net/v1beta1
-kind: RestAPI
-metadata:
-  name: slurm
-  namespace: slurm
-spec:
-  controllerRef:
-    name: slurm
-    namespace: slurm
-  slurmrestd:
-    image: 'ghcr.io/slinkyproject/slurmrestd:25.11-ubuntu24.04'
-    resources:
-      requests:
-        cpu: "500m"
-        memory: "512Mi"
-      limits:
-        cpu: "1"
-        memory: "1Gi"
-
----
-# ServiceMonitor - tells Prometheus to scrape the Slurm REST API
-# (Only needed if using Prometheus Operator / kube-prometheus-stack)
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: slurm-metrics
-  namespace: slurm
-  labels:
-    app.kubernetes.io/part-of: slurm
-spec:
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: slurmrestd
-  endpoints:
-    - port: http
-      interval: 15s
-      path: /metrics
-
----
-# KEDA ScaledObject - autoscales the NodeSet based on pending jobs
+# Scales the Slurm worker NodeSet by polling squeue for pending jobs,
+# then automatically provisions new workers with PyTorch and training scripts.
 #
 # How it works:
-#   - When pending jobs > 0, KEDA scales NodeSet to minReplicaCount
-#   - HPA then scales up toward maxReplicaCount as pending jobs exceed threshold
-#   - When no pending jobs for cooldownPeriod, KEDA scales to idleReplicaCount
-#   - The Slinky operator gracefully drains nodes before terminating pods
+#   1. Every POLL_INTERVAL seconds, exec into slurmctld and run `squeue`
+#   2. Count pending jobs and the max nodes requested by any single job
+#   3. Scale the NodeSet up if there's unmet demand, down if idle
+#   4. After scale-up, wait for new pods to be Ready
+#   5. Install PyTorch and copy training scripts to new workers
+#   6. The Slinky operator handles pod lifecycle (drain before scale-in)
 #
 # Scaling behavior:
-#   0 pending jobs (idle for 5m) -> idleReplicaCount (1 node standing by)
-#   1+ pending jobs              -> minReplicaCount (2 nodes minimum)
-#   pending jobs > threshold     -> HPA scales toward maxReplicaCount
-#   No pending jobs again        -> cooldown, then back to idle
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: scale-slurm-workers
-  namespace: slurm
-spec:
-  scaleTargetRef:
-    apiVersion: slinky.slurm.net/v1beta1
-    kind: NodeSet
-    name: slurm-worker-slinky
-  idleReplicaCount: 1
-  minReplicaCount: 2
-  maxReplicaCount: 8
-  cooldownPeriod: 300
-  pollingInterval: 15
-  advanced:
-    horizontalPodAutoscalerConfig:
-      behavior:
-        scaleUp:
-          stabilizationWindowSeconds: 0
-          policies:
-            - type: Pods
-              value: 2
-              periodSeconds: 60
-        scaleDown:
-          stabilizationWindowSeconds: 300
-          policies:
-            - type: Pods
-              value: 1
-              periodSeconds: 120
-  triggers:
-    # Scale based on pending jobs in the partition
-    - type: prometheus
-      metadata:
-        serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
-        query: slurm_partition_jobs_pending{partition="all"}
-        threshold: "1"
-        activationThreshold: "0"
-
-    # Scale based on the largest pending job's node count requirement
-    # Ensures enough nodes exist for the biggest waiting job
-    - type: prometheus
-      metadata:
-        serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
-        query: slurm_partition_jobs_pending_max_nodes{partition="all"}
-        threshold: "2"
-        activationThreshold: "0"
+#   Pending jobs requesting more nodes than available → scale up + provision
+#   No pending jobs for SCALE_DOWN_DELAY seconds     → scale toward MIN_REPLICAS
+#   Never scales below MIN_REPLICAS or above MAX_REPLICAS
+#
+# Prerequisites:
+#   - Slurm cluster deployed (Controller + NodeSet)
+#   - The autoscaler pod must be schedulable (runs on any linux node)
+#
+# Deploy (two steps):
+#   1. Create the ConfigMap from script files:
+#      oc create configmap slurm-autoscaler-script -n slurm \
+#        --from-file=autoscaler.sh=configs/autoscaler-loop.sh \
+#        --from-file=ddp_test.py=demos/ddp_test.py \
+#        --from-file=submit_job.sh=demos/submit_job.sh \
+#        --from-file=submit_job_autoscale.sh=demos/submit_job_autoscale.sh \
+#        --dry-run=client -o yaml | oc apply -f -
+#
+#   2. Apply RBAC + Deployment:
+#      oc apply -f configs/slurm-autoscaler.yaml
+#
+# Remove:
+#   oc delete -f configs/slurm-autoscaler.yaml
+#   oc delete configmap slurm-autoscaler-script -n slurm
 
 ---
-# (Optional) Additional ScaledObject for GPU partition autoscaling
-# Uncomment and customize if you have a separate GPU NodeSet
-#
-# apiVersion: keda.sh/v1alpha1
-# kind: ScaledObject
-# metadata:
-#   name: scale-slurm-gpu-workers
-#   namespace: slurm
-# spec:
-#   scaleTargetRef:
-#     apiVersion: slinky.slurm.net/v1beta1
-#     kind: NodeSet
-#     name: slurm-worker-gpu
-#   idleReplicaCount: 0
-#   minReplicaCount: 1
-#   maxReplicaCount: 4
-#   cooldownPeriod: 600
-#   pollingInterval: 15
-#   triggers:
-#     - type: prometheus
-#       metadata:
-#         serverAddress: http://prometheus-kube-prometheus-prometheus.monitoring.svc:9090
-#         query: slurm_partition_jobs_pending{partition="gpu"}
-#         threshold: "1"
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: slurm-autoscaler
+  namespace: slurm
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: slurm-autoscaler
+  namespace: slurm
+rules:
+  - apiGroups: ["slinky.slurm.net"]
+    resources: ["nodesets", "nodesets/scale"]
+    verbs: ["get", "list", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec"]
+    verbs: ["get", "list", "create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: slurm-autoscaler
+  namespace: slurm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: slurm-autoscaler
+subjects:
+  - kind: ServiceAccount
+    name: slurm-autoscaler
+    namespace: slurm
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slurm-autoscaler
+  namespace: slurm
+  labels:
+    app.kubernetes.io/name: slurm-autoscaler
+    app.kubernetes.io/part-of: slurm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: slurm-autoscaler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: slurm-autoscaler
+        app.kubernetes.io/part-of: slurm
+    spec:
+      serviceAccountName: slurm-autoscaler
+      nodeSelector:
+        kubernetes.io/os: linux
+      containers:
+        - name: autoscaler
+          image: bitnami/kubectl:latest
+          command: ["/bin/sh", "/scripts/autoscaler.sh"]
+          env:
+            - name: NAMESPACE
+              value: "slurm"
+            - name: NODESET
+              value: "slurm-worker-slinky"
+            - name: CONTROLLER_POD
+              value: "slurm-controller-0"
+            - name: MIN_REPLICAS
+              value: "2"
+            - name: MAX_REPLICAS
+              value: "8"
+            - name: POLL_INTERVAL
+              value: "30"
+            - name: SCALE_DOWN_DELAY
+              value: "300"
+            - name: PYTORCH_INDEX
+              value: "https://download.pytorch.org/whl/cu124"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: scripts
+          configMap:
+            name: slurm-autoscaler-script
+            defaultMode: 0755

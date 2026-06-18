@@ -34,9 +34,14 @@ echo "  Master:       $MASTER_ADDR:$MASTER_PORT"
 echo "  World Size:   $WORLD_SIZE"
 echo "============================================================"
 
+# Results are written by rank 0 to this directory inside the container.
+# Use `oc cp` after the job completes to retrieve them locally.
+export DDP_OUTPUT_DIR="/tmp/ddp-results"
+
 # Launch distributed training via srun
 # Each srun task becomes one rank in the distributed group
 srun python3 /tmp/ddp_test.py \
     --epochs 5 \
     --batch-size 64 \
-    --num-samples 8192
+    --num-samples 8192 \
+    --output-dir "$DDP_OUTPUT_DIR"

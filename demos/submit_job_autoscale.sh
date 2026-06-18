@@ -56,4 +56,5 @@ srun python3 /tmp/ddp_test.py \
     --epochs 5 \
     --batch-size 64 \
     --num-samples 8192 \
-    --autoscale
+    --autoscale \
+    --output-dir /tmp/ddp-results
