@@ -200,8 +200,7 @@ install_slurm_operator_crds() {
     helm upgrade --install slurm-operator-crds \
       oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
       --namespace "$OPERATOR_NS" \
-      --create-namespace \
-      --server-side=false || {
+      --create-namespace || {
         log_error "Failed to install CRDs via Helm"
         log_info "CRDs may already exist. Check with: oc get crd | grep slinky"
         exit 1
@@ -255,7 +254,6 @@ install_slurm_operator() {
       oci://ghcr.io/slinkyproject/charts/slurm-operator \
       --namespace "$OPERATOR_NS" \
       --create-namespace \
-      --server-side=false \
       --wait --timeout 5m || {
         log_error "Failed to install Slurm Operator"
         log_info "If operator is already installed, you may need to:"
@@ -287,22 +285,17 @@ deploy_slurm_cluster() {
   
   log_info "Deploying Slurm cluster..."
   
-  # Check if operator is installed via OperatorHub (most common)
-  # If so, use direct YAML deployment instead of Helm
+  # Check if operator is running (either namespace)
+  # Always use direct YAML deployment — works with both OperatorHub and Helm operators
   if oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator 2>/dev/null | grep -q Running; then
     log_info "Operator detected in openshift-operators (OperatorHub installation)"
-    log_info "Using direct YAML deployment (works with OperatorHub)"
-    deploy_cluster_via_yaml
   elif oc get pods -n "$OPERATOR_NS" -l app.kubernetes.io/name=slurm-operator 2>/dev/null | grep -q Running; then
     log_info "Operator detected in $OPERATOR_NS (Helm installation)"
-    log_info "Attempting Helm deployment..."
-    deploy_cluster_via_helm
   else
-    log_warn "Operator not detected. Attempting Helm deployment anyway..."
-    log_warn "If operator is installed via OperatorHub, this may fail."
-    log_warn "Consider using direct YAML deployment instead."
-    deploy_cluster_via_helm
+    log_warn "Operator not detected in openshift-operators or $OPERATOR_NS"
+    log_warn "Proceeding with YAML deployment anyway (operator may be in another namespace)"
   fi
+  deploy_cluster_via_yaml
 }
 
 deploy_cluster_via_yaml() {
@@ -399,7 +392,6 @@ deploy_cluster_via_helm() {
   
   if [ "$DRY_RUN" = false ]; then
     helm upgrade --install slurm "${helm_args[@]}" \
-      --server-side=false \
       --wait --timeout 10m || {
         log_error "Failed to deploy Slurm cluster via Helm"
         log_warn "If operator is installed via OperatorHub, try using direct YAML deployment instead"
@@ -478,6 +470,34 @@ verify_deployment() {
   log_info "  - Cluster namespace: $NAMESPACE"
 }
 
+deploy_autoscaler() {
+  log_info "Deploying autoscaler..."
+  
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+  AUTOSCALER_SCRIPT="$REPO_ROOT/configs/deploy-autoscaler.sh"
+  
+  if [ ! -f "$AUTOSCALER_SCRIPT" ]; then
+    log_warn "Autoscaler deploy script not found: $AUTOSCALER_SCRIPT"
+    log_warn "Skipping autoscaler deployment"
+    return
+  fi
+  
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY RUN] Would deploy autoscaler via $AUTOSCALER_SCRIPT"
+    return
+  fi
+  
+  NAMESPACE="$NAMESPACE" "$AUTOSCALER_SCRIPT"
+  
+  log_info "Waiting for autoscaler pod to be ready..."
+  oc wait --for=condition=available deployment/slurm-autoscaler -n "$NAMESPACE" --timeout=120s 2>/dev/null || {
+    log_warn "Autoscaler may still be starting. Check: oc get pods -n $NAMESPACE -l app.kubernetes.io/name=slurm-autoscaler"
+  }
+  
+  log_info "✓ Autoscaler deployed (will provision workers with PyTorch automatically)"
+}
+
 # Main execution
 main() {
   log_info "Starting Slinky Operator deployment..."
@@ -499,17 +519,18 @@ main() {
   fi
   
   deploy_slurm_cluster
+  deploy_autoscaler
   verify_deployment
   
   log_info "Deployment completed successfully!"
   log_info ""
   log_info "Next steps:"
-  log_info "1. Check cluster status: oc get controllers,nodesets -n $NAMESPACE"
-  log_info "2. View pods: oc get pods -n $NAMESPACE"
-  log_info "3. Wait for pods to be ready (may take 1-3 minutes)"
-  log_info "4. Submit a test job:"
-  log_info "   CONTROLLER_POD=\$(oc get pods -n $NAMESPACE -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')"
-  log_info "   oc exec -n $NAMESPACE \$CONTROLLER_POD -c slurmctld -- sbatch --wrap='echo Hello'"
+  log_info "1. Wait for autoscaler to provision workers (~2-3 minutes):"
+  log_info "   oc logs -n $NAMESPACE -l app.kubernetes.io/name=slurm-autoscaler -f --tail=15"
+  log_info "2. Submit a DDP training job:"
+  log_info "   oc exec -n $NAMESPACE slurm-controller-0 -c slurmctld -- sbatch /tmp/submit_job_autoscale.sh"
+  log_info "3. Or run the full end-to-end test:"
+  log_info "   ./scripts/run-autoscale-test.sh"
 }
 
 # Run main

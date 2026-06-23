@@ -75,6 +75,10 @@ echo ""
 if oc get namespace "$NAMESPACE" &>/dev/null; then
   log_info "Cleaning cluster namespace: $NAMESPACE"
 
+  log_info "Deleting autoscaler (if deployed)..."
+  run_ignore oc delete -f configs/slurm-autoscaler.yaml --ignore-not-found --timeout=30s
+  run_ignore oc delete configmap slurm-autoscaler-script -n "$NAMESPACE" --ignore-not-found --timeout=30s
+
   log_info "Deleting Controller and NodeSet (custom resources)..."
   run_ignore oc delete controller --all -n "$NAMESPACE" --ignore-not-found --timeout=60s
   run_ignore oc delete nodeset --all -n "$NAMESPACE" --ignore-not-found --timeout=60s

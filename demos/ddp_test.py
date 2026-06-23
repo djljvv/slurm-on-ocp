@@ -127,27 +127,29 @@ class SmallCNN(nn.Module):
 
 class PreallocatedDataset(Dataset):
     """
-    Pre-allocates entire dataset in host memory.
-    This is realistic (mimics loading image files into RAM) and is the primary
-    mechanism that stresses pod memory limits.
+    Pre-allocates a SHARD of the dataset in host memory (data sharding).
+    Each rank only loads its portion (total_samples / world_size), reducing
+    per-node memory proportionally with the number of workers.
 
-    Memory usage: num_samples * channels * H * W * 4 bytes
-      - 5000 images at 224x224x3  = ~2.8 GB
-      - 10000 images at 224x224x3 = ~5.6 GB
-      - 2000 images at 224x224x3  = ~1.1 GB
+    Memory usage per rank: (num_samples / world_size) * channels * H * W * 4 bytes
+      - 8192 images at 224x224x3, 2 ranks = ~2.35 GB each
+      - 8192 images at 224x224x3, 4 ranks = ~1.18 GB each
     """
 
-    def __init__(self, num_samples, image_size=224, num_channels=3, num_classes=1000):
-        self.num_samples = num_samples
+    def __init__(self, num_samples, image_size=224, num_channels=3, num_classes=1000,
+                 rank=0, world_size=1):
         self.num_classes = num_classes
-        print(f"  [Dataset] Pre-allocating {num_samples} images "
+        shard_size = num_samples // max(world_size, 1)
+        self.num_samples = shard_size
+        print(f"  [Dataset] Shard {rank}/{world_size}: allocating {shard_size}/{num_samples} images "
               f"({num_channels}x{image_size}x{image_size}) in host memory...", flush=True)
-        mem_estimate_mb = (num_samples * num_channels * image_size * image_size * 4) / (1024 * 1024)
-        print(f"  [Dataset] Estimated memory: {mem_estimate_mb:.0f} MB", flush=True)
+        mem_estimate_mb = (shard_size * num_channels * image_size * image_size * 4) / (1024 * 1024)
+        print(f"  [Dataset] Estimated memory for this shard: {mem_estimate_mb:.0f} MB", flush=True)
 
-        self.images = torch.randn(num_samples, num_channels, image_size, image_size)
-        self.labels = torch.randint(0, num_classes, (num_samples,))
-        print(f"  [Dataset] Allocation complete.", flush=True)
+        torch.manual_seed(42 + rank)
+        self.images = torch.randn(shard_size, num_channels, image_size, image_size)
+        self.labels = torch.randint(0, num_classes, (shard_size,))
+        print(f"  [Dataset] Shard allocation complete.", flush=True)
 
     def __len__(self):
         return self.num_samples
@@ -310,6 +312,7 @@ def train(rank, world_size, device, args):
         dataset = OnTheFlyDataset(num_samples=args.num_samples, image_size=32, num_classes=10)
         model = SmallCNN(num_classes=10).to(device)
         num_workers = 2
+        use_sampler = True
     else:
         image_size = 224
         num_classes = 1000
@@ -317,15 +320,20 @@ def train(rank, world_size, device, args):
             num_samples=args.num_samples,
             image_size=image_size,
             num_classes=num_classes,
+            rank=rank,
+            world_size=world_size,
         )
         model = ResNet18(num_classes=num_classes).to(device)
-        num_workers = args.num_workers
+        num_workers = 0
+        use_sampler = False
 
     if rank == 0:
         rss = get_host_memory_mb()
         print(f"  [Memory] Process RSS after dataset+model load: {rss:.0f} MB", flush=True)
 
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank) if world_size > 1 else None
+    sampler = None
+    if use_sampler and world_size > 1:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,

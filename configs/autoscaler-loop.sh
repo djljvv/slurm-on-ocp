@@ -141,22 +141,22 @@ while true; do
   PENDING_OUTPUT=$(get_pending_info 2>/dev/null || echo "")
 
   PENDING_COUNT=0
-  MAX_NODES_NEEDED=0
+  TOTAL_NODES_NEEDED=0
   if [ -n "$PENDING_OUTPUT" ]; then
     PENDING_COUNT=$(echo "$PENDING_OUTPUT" | wc -l | tr -d ' ')
-    MAX_NODES_NEEDED=$(echo "$PENDING_OUTPUT" | awk '{if($2>m)m=$2} END{print m+0}')
+    TOTAL_NODES_NEEDED=$(echo "$PENDING_OUTPUT" | awk '{s+=$2} END{print s+0}')
   fi
 
   NOW=$(date +%s)
 
   if [ "$PENDING_COUNT" -gt 0 ]; then
     LAST_PENDING_TIME="$NOW"
-    DESIRED="$MAX_NODES_NEEDED"
+    DESIRED=$((CURRENT + TOTAL_NODES_NEEDED))
     [ "$DESIRED" -lt "$MIN_REPLICAS" ] && DESIRED="$MIN_REPLICAS"
     [ "$DESIRED" -gt "$MAX_REPLICAS" ] && DESIRED="$MAX_REPLICAS"
 
     if [ "$DESIRED" -gt "$CURRENT" ]; then
-      log "DEMAND: ${PENDING_COUNT} pending job(s), largest needs ${MAX_NODES_NEEDED} node(s), have ${CURRENT}"
+      log "DEMAND: ${PENDING_COUNT} pending job(s), need ${TOTAL_NODES_NEEDED} more node(s), have ${CURRENT}"
       scale_nodeset "$DESIRED"
     else
       log "OK: ${PENDING_COUNT} pending, ${CURRENT} replicas sufficient"

@@ -20,7 +20,10 @@
 #   - Slurm cluster deployed (Controller + NodeSet)
 #   - The autoscaler pod must be schedulable (runs on any linux node)
 #
-# Deploy (two steps):
+# Deploy (one command):
+#   ./configs/deploy-autoscaler.sh
+#
+# Deploy (manual alternative):
 #   1. Create the ConfigMap from script files:
 #      oc create configmap slurm-autoscaler-script -n slurm \
 #        --from-file=autoscaler.sh=configs/autoscaler-loop.sh \

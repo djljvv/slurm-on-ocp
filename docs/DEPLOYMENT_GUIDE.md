@@ -170,6 +170,7 @@ If operator is installed via Software Catalog/OperatorHub, use Option B (Direct 
 This will:
 - Detect existing CRDs and operator (skip installation)
 - Deploy cluster using direct YAML (works with OperatorHub)
+- Deploy the autoscaler (provisions workers with PyTorch automatically)
 - Handle all setup automatically
 
 #### Option B: Using Direct YAML (Works with OperatorHub)
@@ -1321,8 +1322,11 @@ oc delete namespace slurm
 
 **To deploy from scratch:**
 ```bash
-# Complete deployment in correct order
+# Complete deployment (cluster + autoscaler) in correct order
 ./scripts/deploy-slurm.sh
+
+# Then run the DDP training test:
+./scripts/run-autoscale-test.sh
 ```
 
 
