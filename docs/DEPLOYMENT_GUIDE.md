@@ -1090,6 +1090,7 @@ oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch --output=/tmp/job3.ou
 
 # Monitor queue in real-time
 watch -n 2 "oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue"
+# macOS (no watch): while true; do clear; oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue; sleep 2; done
 
 # Or check once
 oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue

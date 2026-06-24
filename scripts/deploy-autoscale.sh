@@ -163,7 +163,7 @@ echo \"[\$(hostname)] Ready (torch \$(python3 -c 'import torch; print(torch.__ve
 python3 /tmp/ddp_test.py --intensity $INTENSITY --epochs $EPOCHS --batch-size $BATCH_SIZE --num-samples $NUM_SAMPLES --autoscale --output-dir /tmp/ddp-results
 " 2>&1)
 
-  JOB_ID=$(echo "$SBATCH_OUTPUT" | grep -oP 'Submitted batch job \K[0-9]+' || echo "")
+  JOB_ID=$(echo "$SBATCH_OUTPUT" | awk '/Submitted batch job/{print $4}')
 
   if [ -z "$JOB_ID" ]; then
     warn "Failed to submit job: $SBATCH_OUTPUT"

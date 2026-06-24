@@ -84,7 +84,7 @@ section "Submitting job"
 SBATCH_OUTPUT=$(oc exec -n "$NAMESPACE" "$CONTROLLER" -c slurmctld -- \
   bash -c "INTENSITY=light NUM_SAMPLES=8192 MAX_NODES=$NODES bash /tmp/submit_job_autoscale.sh" 2>&1)
 
-JOB_ID=$(echo "$SBATCH_OUTPUT" | grep -oP 'Submitted batch job \K[0-9]+')
+JOB_ID=$(echo "$SBATCH_OUTPUT" | awk '/Submitted batch job/{print $4}')
 
 if [ -z "$JOB_ID" ]; then
   err "Failed to submit job: $SBATCH_OUTPUT"
@@ -127,7 +127,7 @@ fi
 section "Retrieving results"
 
 BATCH_HOST=$(oc exec -n "$NAMESPACE" "$CONTROLLER" -c slurmctld -- \
-  scontrol show job "$JOB_ID" 2>/dev/null | grep -oP 'BatchHost=\K\S+' || echo "")
+  scontrol show job "$JOB_ID" 2>/dev/null | awk -F= '/BatchHost/{print $2}' | awk '{print $1}' || echo "")
 
 if [ -z "$BATCH_HOST" ]; then
   warn "Could not determine BatchHost (job may have been purged). Trying slinky-0..."

@@ -362,6 +362,12 @@ watch -n 5 'oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue -l 2>/dev
 watch -n 5 'oc get nodeset -n slurm'
 ```
 
+**macOS:** `watch` is not installed by default. Install via `brew install watch`, or use a loop:
+```bash
+# macOS alternative for any watch command above:
+while true; do clear; oc get pods -n slurm -o wide; sleep 5; done
+```
+
 ### What You'll See (4-node autoscale flow)
 
 1. `squeue` shows the job as **PD** (pending) with reason `Resources`
