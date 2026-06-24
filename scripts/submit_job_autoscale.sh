@@ -51,72 +51,84 @@ echo "  Minimum nodes:    ${MIN_NODES}"
 echo "  Requesting:       --nodes=${MIN_NODES}-${MAX_NODES}"
 echo "============================================================"
 
-# --- Submit the actual batch job with calculated node range ---
-sbatch --nodes=${MIN_NODES}-${MAX_NODES} --ntasks-per-node=1 --job-name=ddp-elastic \
-  --cpus-per-task=2 --time=00:30:00 --time-min=00:10:00 \
-  --output=/tmp/ddp-elastic-%j.out --error=/tmp/ddp-elastic-%j.err \
-  --export=ALL,NUM_SAMPLES=${NUM_SAMPLES},INTENSITY=${INTENSITY},EPOCHS=${EPOCHS},BATCH_SIZE=${BATCH_SIZE} \
-  --requeue <<'BATCH_SCRIPT'
+# --- Generate batch script with #SBATCH directives (avoids env retrieval bug) ---
+BATCH_FILE="/tmp/ddp-elastic-batch-$$.sh"
+cat > "$BATCH_FILE" << EOF
 #!/bin/bash
+#SBATCH --job-name=ddp-elastic
+#SBATCH --nodes=${MIN_NODES}-${MAX_NODES}
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=2
+#SBATCH --time=00:30:00
+#SBATCH --time-min=00:10:00
+#SBATCH --output=/tmp/ddp-elastic-%j.out
+#SBATCH --error=/tmp/ddp-elastic-%j.err
+#SBATCH --export=ALL
 
-export MASTER_ADDR=$(scontrol show hostname $SLURM_NODELIST | head -n1)
+export MASTER_ADDR=\$(scontrol show hostname \$SLURM_NODELIST | head -n1)
 export MASTER_PORT=29500
-export WORLD_SIZE=$SLURM_NTASKS
+export WORLD_SIZE=\$SLURM_NTASKS
+export INTENSITY="${INTENSITY}"
+export NUM_SAMPLES="${NUM_SAMPLES}"
+export EPOCHS="${EPOCHS}"
+export BATCH_SIZE="${BATCH_SIZE}"
 
 echo "============================================================"
 echo "  ELASTIC DDP TRAINING"
 echo "============================================================"
-echo "  Job ID:       $SLURM_JOB_ID"
-echo "  Nodes:        $SLURM_NNODES (requested: $SLURM_JOB_NUM_NODES)"
-echo "  Tasks:        $SLURM_NTASKS"
-echo "  Node list:    $SLURM_NODELIST"
-echo "  Master:       $MASTER_ADDR:$MASTER_PORT"
-echo "  World Size:   $WORLD_SIZE"
-echo "  Hostname:     $(hostname)"
-echo "  Start time:   $(date)"
-echo "  Requeue:      enabled"
-echo "  Intensity:    $INTENSITY"
-echo "  Num samples:  $NUM_SAMPLES"
+echo "  Job ID:       \$SLURM_JOB_ID"
+echo "  Nodes:        \$SLURM_NNODES (requested: \$SLURM_JOB_NUM_NODES)"
+echo "  Tasks:        \$SLURM_NTASKS"
+echo "  Node list:    \$SLURM_NODELIST"
+echo "  Master:       \$MASTER_ADDR:\$MASTER_PORT"
+echo "  World Size:   \$WORLD_SIZE"
+echo "  Hostname:     \$(hostname)"
+echo "  Start time:   \$(date)"
+echo "  Intensity:    \$INTENSITY"
+echo "  Num samples:  \$NUM_SAMPLES"
 echo "============================================================"
 echo ""
 
 srun bash -c '
 MAX_WAIT=600
 ELAPSED=0
-echo "[$(hostname)] Waiting for PyTorch and training script..."
+echo "[\$(hostname)] Waiting for PyTorch and training script..."
 while ! python3 -c "import torch" 2>/dev/null || [ ! -f /tmp/ddp_test.py ]; do
-  if [ $ELAPSED -ge $MAX_WAIT ]; then
-    echo "[$(hostname)] TIMEOUT after ${MAX_WAIT}s — PyTorch not provisioned"
+  if [ \$ELAPSED -ge \$MAX_WAIT ]; then
+    echo "[\$(hostname)] TIMEOUT after \${MAX_WAIT}s"
     exit 1
   fi
-  echo "[$(hostname)] Not ready yet, retrying in 15s... (${ELAPSED}/${MAX_WAIT}s)"
+  echo "[\$(hostname)] Not ready yet, retrying in 15s... (\${ELAPSED}/\${MAX_WAIT}s)"
   sleep 15
-  ELAPSED=$((ELAPSED + 15))
+  ELAPSED=\$((ELAPSED + 15))
 done
-echo "[$(hostname)] Ready after ${ELAPSED}s (torch $(python3 -c "import torch; print(torch.__version__)"))"
+echo "[\$(hostname)] Ready after \${ELAPSED}s (torch \$(python3 -c "import torch; print(torch.__version__)"))"
 
 python3 /tmp/ddp_test.py \
-    --intensity '"'"'$INTENSITY'"'"' \
-    --epochs $EPOCHS \
-    --batch-size $BATCH_SIZE \
-    --num-samples $NUM_SAMPLES \
+    --intensity \$INTENSITY \
+    --epochs \$EPOCHS \
+    --batch-size \$BATCH_SIZE \
+    --num-samples \$NUM_SAMPLES \
     --autoscale \
     --output-dir /tmp/ddp-results
 '
 
-JOB_EXIT=$?
+JOB_EXIT=\$?
 echo ""
 echo "============================================================"
-echo "  Job completed at: $(date)"
-echo "  Exit code:        $JOB_EXIT"
-if [ $JOB_EXIT -eq 0 ]; then
-    echo "  RESULT: SUCCESS — DDP training ran across $SLURM_NNODES node(s)"
+echo "  Job completed at: \$(date)"
+echo "  Exit code:        \$JOB_EXIT"
+if [ \$JOB_EXIT -eq 0 ]; then
+    echo "  RESULT: SUCCESS — DDP training ran across \$SLURM_NNODES node(s)"
     echo ""
-    echo "  Results saved on batch host: $(hostname)"
+    echo "  Results saved on batch host: \$(hostname)"
     echo "  Retrieve with:"
-    echo "    oc cp slurm/$(hostname):/tmp/ddp-results results/ -c slurmd"
+    echo "    oc cp slurm/\$(hostname):/tmp/ddp-results results/ -c slurmd"
 else
-    echo "  RESULT: FAILED (exit code $JOB_EXIT)"
+    echo "  RESULT: FAILED (exit code \$JOB_EXIT)"
 fi
 echo "============================================================"
-BATCH_SCRIPT
+EOF
+
+sbatch "$BATCH_FILE"
+rm -f "$BATCH_FILE"

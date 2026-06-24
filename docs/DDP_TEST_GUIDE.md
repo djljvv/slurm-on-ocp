@@ -67,17 +67,17 @@ This guide walks through running **distributed PyTorch training** on Slurm-manag
 | File | Purpose |
 |------|---------|
 | `scripts/deploy-slurm.sh` | Full deploy (cluster + autoscaler) in one command |
-| `scripts/run-autoscale-test.sh` | End-to-end test runner (submit, wait, retrieve results) |
+| `scripts/deploy-autoscale.sh` | Setup autoscaler infra + submit self-sizing jobs |
+| `scripts/run-autoscale-test.sh` | End-to-end test (submit, wait, retrieve results, pass/fail) |
 | `scripts/cleanup-slurm.sh` | Tear down cluster and autoscaler |
-| `configs/deploy-autoscaler.sh` | Redeploy just the autoscaler (after script changes) |
+| `scripts/autoscaler-loop.sh` | The polling script that runs inside the autoscaler pod |
+| `scripts/submit_job.sh` | Standard fixed-node Slurm batch script (manual fallback) |
+| `scripts/submit_job_autoscale.sh` | Self-sizing elastic batch script (calculates min nodes from dataset) |
+| `scripts/submit_job_oom.sh` | OOM-triggering batch script (for constrained demo) |
 | `configs/slurm-autoscaler.yaml` | ServiceAccount, RBAC, and Deployment for the autoscaler pod |
-| `configs/autoscaler-loop.sh` | The polling script that runs inside the autoscaler pod |
 | `configs/slurm-cluster.yaml` | Standard cluster config (4Gi worker memory) |
 | `configs/slurm-cluster-constrained.yaml` | Constrained config (1Gi) for the OOM demo |
 | `demos/ddp_test.py` | DDP training script with intensity levels and `--autoscale` flag |
-| `demos/submit_job.sh` | Standard fixed-node Slurm batch script (manual fallback) |
-| `demos/submit_job_autoscale.sh` | Elastic batch script (`--nodes=1-4`, `--requeue`, readiness gate) |
-| `demos/submit_job_oom.sh` | OOM-triggering batch script (for constrained demo) |
 
 ---
 
@@ -89,15 +89,23 @@ If the cluster is already deployed, you can run the full DDP training test with 
 # Deploy cluster + autoscaler (if not already running)
 ./scripts/deploy-slurm.sh
 
-# Run the end-to-end DDP test (copies files, submits job, waits, retrieves results)
+# Run end-to-end test (submits light job, waits for completion, retrieves results, prints pass/fail)
 ./scripts/run-autoscale-test.sh
 
-# Or with 4 nodes to force autoscaling:
-./scripts/run-autoscale-test.sh --nodes 4
+# Or: setup autoscaler + submit a medium-intensity self-sizing job (fire-and-forget)
+./scripts/deploy-autoscale.sh
+
+# Submit only (autoscaler already deployed), with custom dataset size:
+NUM_SAMPLES=12000 ./scripts/deploy-autoscale.sh --submit-only
 
 # Tear everything down when done
 ./scripts/cleanup-slurm.sh
 ```
+
+| Script | What it does | Blocks? | Retrieves results? |
+|--------|-------------|---------|-------------------|
+| `deploy-autoscale.sh` | Setup infra + submit job | No | No |
+| `run-autoscale-test.sh` | Submit light job + wait + retrieve + verdict | Yes | Yes |
 
 The rest of this guide walks through each step manually for understanding and debugging.
 
@@ -241,7 +249,7 @@ oc patch nodeset slurm-worker-slinky -n slurm --type='merge' -p '{
 The autoscaler handles **everything** after this point — it installs PyTorch on workers, copies training scripts, and scales the cluster up/down based on job demand.
 
 ```bash
-./configs/deploy-autoscaler.sh
+./scripts/deploy-autoscale.sh --setup-only
 ```
 
 This creates:
@@ -678,7 +686,7 @@ oc rollout restart deployment slurm-autoscaler -n slurm
 If you modify `autoscaler-loop.sh`, `ddp_test.py`, or submit scripts, re-run the deploy script and restart:
 
 ```bash
-./configs/deploy-autoscaler.sh
+./scripts/deploy-autoscale.sh --setup-only
 oc rollout restart deployment slurm-autoscaler -n slurm
 ```
 
@@ -886,7 +894,7 @@ done
 
 oc cp demos/ddp_test.py slurm/slurm-worker-slinky-0:/tmp/ddp_test.py -c slurmd
 oc cp demos/ddp_test.py slurm/slurm-worker-slinky-1:/tmp/ddp_test.py -c slurmd
-oc cp demos/submit_job_oom.sh slurm/slurm-controller-0:/tmp/submit_job_oom.sh -c slurmctld
+oc cp scripts/submit_job_oom.sh slurm/slurm-controller-0:/tmp/submit_job_oom.sh -c slurmctld
 ```
 
 ### Submit and Observe Failure
@@ -943,7 +951,7 @@ For GPU workers use `https://download.pytorch.org/whl/cu124` instead. If switchi
 ```bash
 oc cp demos/ddp_test.py slurm/slurm-worker-slinky-0:/tmp/ddp_test.py -c slurmd
 oc cp demos/ddp_test.py slurm/slurm-worker-slinky-1:/tmp/ddp_test.py -c slurmd
-oc cp demos/submit_job.sh slurm/slurm-controller-0:/tmp/submit_job.sh -c slurmctld
+oc cp scripts/submit_job.sh slurm/slurm-controller-0:/tmp/submit_job.sh -c slurmctld
 
 oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch /tmp/submit_job.sh
 ```
@@ -961,7 +969,7 @@ oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- cat /tmp/ddp-test-JOB_ID.out
 
 ### The Autoscaler Loop
 
-The autoscaler is a shell script (`configs/autoscaler-loop.sh`) running in a `bitnami/kubectl` pod:
+The autoscaler is a shell script (`scripts/autoscaler-loop.sh`) running in a `bitnami/kubectl` pod:
 
 1. **Poll:** Every `POLL_INTERVAL` seconds, exec into `slurmctld` and run `squeue -h -t PENDING -o "%i %D"` to get pending job IDs and their requested node counts.
 

@@ -68,12 +68,13 @@ log "Found workers: $WORKERS"
 section "Copying files to cluster"
 
 log "Copying submit script to controller..."
-oc cp "$REPO_ROOT/demos/submit_job_autoscale.sh" \
+oc cp "$SCRIPT_DIR/submit_job_autoscale.sh" \
   "$NAMESPACE/$CONTROLLER:/tmp/submit_job_autoscale.sh" -c slurmctld
 
 log "Copying training script to workers..."
 for worker in $WORKERS; do
   oc cp "$REPO_ROOT/demos/ddp_test.py" "$NAMESPACE/$worker:/tmp/ddp_test.py" -c slurmd
+
   log "  → $worker"
 done
 
@@ -81,7 +82,7 @@ done
 section "Submitting job"
 
 SBATCH_OUTPUT=$(oc exec -n "$NAMESPACE" "$CONTROLLER" -c slurmctld -- \
-  sbatch -N "$NODES" --ntasks="$NODES" /tmp/submit_job_autoscale.sh 2>&1)
+  bash -c "INTENSITY=light NUM_SAMPLES=8192 MAX_NODES=$NODES bash /tmp/submit_job_autoscale.sh" 2>&1)
 
 JOB_ID=$(echo "$SBATCH_OUTPUT" | grep -oP 'Submitted batch job \K[0-9]+')
 

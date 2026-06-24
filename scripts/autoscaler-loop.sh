@@ -151,12 +151,12 @@ while true; do
 
   if [ "$PENDING_COUNT" -gt 0 ]; then
     LAST_PENDING_TIME="$NOW"
-    DESIRED=$((CURRENT + TOTAL_NODES_NEEDED))
+    DESIRED="$TOTAL_NODES_NEEDED"
     [ "$DESIRED" -lt "$MIN_REPLICAS" ] && DESIRED="$MIN_REPLICAS"
     [ "$DESIRED" -gt "$MAX_REPLICAS" ] && DESIRED="$MAX_REPLICAS"
 
     if [ "$DESIRED" -gt "$CURRENT" ]; then
-      log "DEMAND: ${PENDING_COUNT} pending job(s), need ${TOTAL_NODES_NEEDED} more node(s), have ${CURRENT}"
+      log "DEMAND: ${PENDING_COUNT} pending job(s), total need ${TOTAL_NODES_NEEDED} node(s), have ${CURRENT}"
       scale_nodeset "$DESIRED"
     else
       log "OK: ${PENDING_COUNT} pending, ${CURRENT} replicas sufficient"

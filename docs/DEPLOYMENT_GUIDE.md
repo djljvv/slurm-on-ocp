@@ -764,8 +764,8 @@ EOF
 # Check Controller and NodeSet resources (namespace: slurm by default, or your custom namespace)
 oc get controllers -n slurm
 oc get nodesets -n slurm
-oc describe controller slurm -n slurm
-oc describe nodeset slurm-worker-slinky -n slurm
+oc describe controller <controller-name> -n slurm
+oc describe nodeset <nodeset-name> -n slurm
 
 # Check pods being created
 oc get pods -n slurm
@@ -1325,8 +1325,11 @@ oc delete namespace slurm
 # Complete deployment (cluster + autoscaler) in correct order
 ./scripts/deploy-slurm.sh
 
-# Then run the DDP training test:
+# Run end-to-end test (light intensity, waits for completion, prints pass/fail):
 ./scripts/run-autoscale-test.sh
+
+# Or submit a self-sizing job (fire-and-forget, medium intensity):
+./scripts/deploy-autoscale.sh --submit-only
 ```
 
 

@@ -165,7 +165,7 @@ install_cert_manager() {
     oc wait --for=condition=ready pod \
       -l app.kubernetes.io/name=cert-manager \
       -n "$CERT_MANAGER_NS" \
-      --timeout=300s || true
+      --timeout=60s || true
   else
     log_info "[DRY RUN] Would install cert-manager"
   fi
@@ -197,6 +197,11 @@ install_slurm_operator_crds() {
   log_info "Installing Slurm Operator CRDs via Helm..."
   
   if [ "$DRY_RUN" = false ]; then
+    helm upgrade --install slurm-operator-crds \
+      oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
+      --namespace "$OPERATOR_NS" \
+      --create-namespace \
+      --server-side=false 2>/dev/null || \
     helm upgrade --install slurm-operator-crds \
       oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
       --namespace "$OPERATOR_NS" \
@@ -254,6 +259,12 @@ install_slurm_operator() {
       oci://ghcr.io/slinkyproject/charts/slurm-operator \
       --namespace "$OPERATOR_NS" \
       --create-namespace \
+      --server-side=false \
+      --wait --timeout 5m 2>/dev/null || \
+    helm upgrade --install slurm-operator \
+      oci://ghcr.io/slinkyproject/charts/slurm-operator \
+      --namespace "$OPERATOR_NS" \
+      --create-namespace \
       --wait --timeout 5m || {
         log_error "Failed to install Slurm Operator"
         log_info "If operator is already installed, you may need to:"
@@ -266,7 +277,7 @@ install_slurm_operator() {
     oc wait --for=condition=ready pod \
       -l app.kubernetes.io/name=slurm-operator \
       -n "$OPERATOR_NS" \
-      --timeout=300s || {
+      --timeout=90s || {
         log_error "Slurm Operator did not become ready"
         exit 1
       }
@@ -356,7 +367,7 @@ deploy_cluster_via_yaml() {
   
   # Wait for Controller to reach Ready (slurmctld pod running and healthy)
   log_info "Waiting for Controller to be Ready..."
-  if oc wait --for=condition=Ready controller/slurm -n "$NAMESPACE" --timeout=300s 2>/dev/null; then
+  if oc wait --for=condition=Ready controller/slurm -n "$NAMESPACE" --timeout=90s 2>/dev/null; then
     log_info "✓ Controller is Ready"
   else
     log_warn "Controller did not report Ready within timeout (may still be starting)"
@@ -365,7 +376,7 @@ deploy_cluster_via_yaml() {
   
   # Wait for NodeSet to reach Ready (compute pods and Slurm node state)
   log_info "Waiting for NodeSet to be Ready..."
-  if oc wait --for=condition=Ready nodeset/slurm-worker-slinky -n "$NAMESPACE" --timeout=600s 2>/dev/null; then
+  if oc wait --for=condition=Ready nodeset/slurm-worker-slinky -n "$NAMESPACE" --timeout=120s 2>/dev/null; then
     log_info "✓ NodeSet is Ready"
   else
     log_warn "NodeSet did not report Ready within timeout (may still be starting)"
@@ -470,33 +481,6 @@ verify_deployment() {
   log_info "  - Cluster namespace: $NAMESPACE"
 }
 
-deploy_autoscaler() {
-  log_info "Deploying autoscaler..."
-  
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-  AUTOSCALER_SCRIPT="$REPO_ROOT/configs/deploy-autoscaler.sh"
-  
-  if [ ! -f "$AUTOSCALER_SCRIPT" ]; then
-    log_warn "Autoscaler deploy script not found: $AUTOSCALER_SCRIPT"
-    log_warn "Skipping autoscaler deployment"
-    return
-  fi
-  
-  if [ "$DRY_RUN" = true ]; then
-    log_info "[DRY RUN] Would deploy autoscaler via $AUTOSCALER_SCRIPT"
-    return
-  fi
-  
-  NAMESPACE="$NAMESPACE" "$AUTOSCALER_SCRIPT"
-  
-  log_info "Waiting for autoscaler pod to be ready..."
-  oc wait --for=condition=available deployment/slurm-autoscaler -n "$NAMESPACE" --timeout=120s 2>/dev/null || {
-    log_warn "Autoscaler may still be starting. Check: oc get pods -n $NAMESPACE -l app.kubernetes.io/name=slurm-autoscaler"
-  }
-  
-  log_info "✓ Autoscaler deployed (will provision workers with PyTorch automatically)"
-}
 
 # Main execution
 main() {
@@ -519,8 +503,19 @@ main() {
   fi
   
   deploy_slurm_cluster
-  deploy_autoscaler
   verify_deployment
+
+  # Deploy autoscaler (setup only — no job submission)
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ "$DRY_RUN" = true ]; then
+    log_info "[DRY RUN] Would deploy autoscaler via ./scripts/deploy-autoscale.sh --setup-only"
+  elif [ -f "$SCRIPT_DIR/deploy-autoscale.sh" ]; then
+    log_info "Deploying autoscaler..."
+    NAMESPACE="$NAMESPACE" "$SCRIPT_DIR/deploy-autoscale.sh" --setup-only
+    log_info "✓ Autoscaler deployed"
+  else
+    log_warn "Autoscaler script not found at $SCRIPT_DIR/deploy-autoscale.sh, skipping"
+  fi
   
   log_info "Deployment completed successfully!"
   log_info ""

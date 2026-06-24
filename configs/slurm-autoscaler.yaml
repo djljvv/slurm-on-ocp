@@ -21,15 +21,15 @@
 #   - The autoscaler pod must be schedulable (runs on any linux node)
 #
 # Deploy (one command):
-#   ./configs/deploy-autoscaler.sh
+#   ./scripts/deploy-autoscale.sh --setup-only
 #
 # Deploy (manual alternative):
 #   1. Create the ConfigMap from script files:
 #      oc create configmap slurm-autoscaler-script -n slurm \
-#        --from-file=autoscaler.sh=configs/autoscaler-loop.sh \
+#        --from-file=autoscaler.sh=scripts/autoscaler-loop.sh \
 #        --from-file=ddp_test.py=demos/ddp_test.py \
-#        --from-file=submit_job.sh=demos/submit_job.sh \
-#        --from-file=submit_job_autoscale.sh=demos/submit_job_autoscale.sh \
+#        --from-file=submit_job.sh=scripts/submit_job.sh \
+#        --from-file=submit_job_autoscale.sh=scripts/submit_job_autoscale.sh \
 #        --dry-run=client -o yaml | oc apply -f -
 #
 #   2. Apply RBAC + Deployment:

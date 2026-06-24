@@ -45,8 +45,6 @@ spec:
     resources: {}
   extraConf: |
     PartitionName=all Nodes=ALL Default=YES MaxTime=UNLIMITED State=UP
-    # Increase job retention time in memory (default is 300 seconds = 5 minutes)
-    # Set to 3600 seconds (1 hour) - adjust as needed
     MinJobAge=3600
 ---
 # NodeSet (Compute Nodes) - Note: requires controllerRef
