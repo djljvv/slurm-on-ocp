@@ -5,7 +5,7 @@ Simulates a realistic GPU training workload (ResNet-18 on ImageNet-scale data)
 to validate multi-node coordination and stress-test resource limits.
 
 Launch methods:
-  1. Via Slurm:   sbatch submit_job.sh
+  1. Via Slurm:   bash submit_job_autoscale.sh
   2. Via torchrun: torchrun --nnodes=N --nproc_per_node=1 ddp_test.py
   3. Single-node:  python ddp_test.py (auto-detects single GPU or CPU)
 

@@ -62,7 +62,7 @@ provision_worker() {
   fi
 
   # Use cat|exec instead of kubectl cp to follow configmap symlinks
-  for script in ddp_test.py submit_job.sh submit_job_autoscale.sh; do
+  for script in ddp_test.py submit_job_autoscale.sh; do
     if [ -f "/scripts/${script}" ]; then
       cat "/scripts/${script}" | kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -i -- sh -c "cat > /tmp/${script}" 2>/dev/null || true
     fi
@@ -108,7 +108,7 @@ provision_new_workers() {
 provision_controller() {
   log "PROVISION: copying submit scripts to controller..."
   # Use cat|exec instead of kubectl cp to follow configmap symlinks
-  for script in submit_job.sh submit_job_autoscale.sh; do
+  for script in submit_job_autoscale.sh; do
     if [ -f "/scripts/${script}" ]; then
       cat "/scripts/${script}" | kubectl exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -i -- sh -c "cat > /tmp/${script}" 2>/dev/null || true
     fi

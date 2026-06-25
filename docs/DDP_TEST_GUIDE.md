@@ -71,12 +71,9 @@ This guide walks through running **distributed PyTorch training** on Slurm-manag
 | `scripts/run-autoscale-test.sh` | End-to-end test (submit, wait, retrieve results, pass/fail) |
 | `scripts/cleanup-slurm.sh` | Tear down cluster and autoscaler |
 | `scripts/autoscaler-loop.sh` | The polling script that runs inside the autoscaler pod |
-| `scripts/submit_job.sh` | Standard fixed-node Slurm batch script (manual fallback) |
 | `scripts/submit_job_autoscale.sh` | Self-sizing elastic batch script (calculates min nodes from dataset) |
-| `scripts/submit_job_oom.sh` | OOM-triggering batch script (for constrained demo) |
 | `configs/slurm-autoscaler.yaml` | ServiceAccount, RBAC, and Deployment for the autoscaler pod |
 | `configs/slurm-cluster.yaml` | Standard cluster config (4Gi worker memory) |
-| `configs/slurm-cluster-constrained.yaml` | Constrained config (1Gi) for the OOM demo |
 | `demos/ddp_test.py` | DDP training script with intensity levels and `--autoscale` flag |
 
 ---
@@ -129,122 +126,7 @@ oc exec -n slurm slurm-controller-0 -c slurmctld -- sinfo
 
 ---
 
-## Step 1: Clear Any Stuck Jobs
-
-Previous jobs may be stuck with "user env retrieval failed requeued held" — a common issue in containerized Slurm where login environment resolution fails.
-
-```bash
-# Check for stuck jobs
-oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue
-
-# Cancel all stuck pending jobs (if any)
-oc exec -n slurm slurm-controller-0 -c slurmctld -- scancel --state=PENDING -u slurm
-
-# Verify queue is empty
-oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue
-```
-
-**Root Cause:** Slurm tries to retrieve the user's login environment via `su -l` which fails in containers. The fix is `#SBATCH --export=ALL` in the submit script (already included).
-
----
-
-## Step 2: Configure GPU Access (Required for GPU Testing)
-
-By default, Slurm worker pods don't request GPU resources and may land on CPU-only nodes. To run the DDP test on GPUs, you need to patch the NodeSet to:
-1. Request `nvidia.com/gpu` resources (so the pod gets a GPU allocated)
-2. Add a `nodeSelector` targeting GPU-labeled nodes
-3. Add a `toleration` for any GPU node taints
-
-**Check if your cluster has GPUs:**
-
-```bash
-# List nodes with GPU allocatable resources
-oc get nodes -o custom-columns='NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu'
-
-# Check for GPU node labels
-oc get nodes -l nvidia.com/gpu.present=true -o name
-
-# Check GPU node taints (note the taint key for the toleration below)
-oc get nodes -l nvidia.com/gpu.present=true -o custom-columns='NAME:.metadata.name,TAINTS:.spec.taints[*].key'
-```
-
-**Patch the NodeSet to request GPUs:**
-
-Adjust CPU and memory values based on your workload. The defaults below (2Gi request, 4Gi limit) are sized for `--intensity light`. For heavier workloads, increase the memory limit and add a `/dev/shm` volume mount for DataLoader shared memory.
-
-```bash
-oc patch nodeset slurm-worker-slinky -n slurm --type='merge' -p '{
-  "spec": {
-    "slurmd": {
-      "resources": {
-        "limits": {
-          "cpu": "2",
-          "memory": "4Gi",
-          "nvidia.com/gpu": "1"
-        },
-        "requests": {
-          "cpu": "1",
-          "memory": "2Gi",
-          "nvidia.com/gpu": "1"
-        }
-      }
-    },
-    "template": {
-      "spec": {
-        "nodeSelector": {
-          "kubernetes.io/os": "linux",
-          "nvidia.com/gpu.present": "true"
-        },
-        "tolerations": [
-          {
-            "key": "g5-gpu",
-            "operator": "Equal",
-            "value": "true",
-            "effect": "NoSchedule"
-          }
-        ]
-      }
-    }
-  }
-}'
-```
-
-**Note:** The `tolerations` key (`g5-gpu` above) must match your cluster's GPU node taint. Check with:
-```bash
-oc get nodes <gpu-node-name> -o jsonpath='{.spec.taints}'
-```
-
-**Wait for pods to restart on GPU nodes:**
-
-```bash
-oc get pods -n slurm -o wide -w
-oc get pods -n slurm -o wide | grep worker
-```
-
-**Revert to CPU-only (if needed):**
-
-```bash
-oc patch nodeset slurm-worker-slinky -n slurm --type='merge' -p '{
-  "spec": {
-    "slurmd": {
-      "resources": {
-        "limits": { "cpu": "2", "memory": "4Gi" },
-        "requests": { "cpu": "1", "memory": "2Gi" }
-      }
-    },
-    "template": {
-      "spec": {
-        "nodeSelector": { "kubernetes.io/os": "linux" },
-        "tolerations": []
-      }
-    }
-  }
-}'
-```
-
----
-
-## Step 3: Deploy the Autoscaler
+## Step 1: Deploy the Autoscaler
 
 The autoscaler handles **everything** after this point — it installs PyTorch on workers, copies training scripts, and scales the cluster up/down based on job demand.
 
@@ -304,7 +186,7 @@ These are set as env vars in `configs/slurm-autoscaler.yaml`.
 
 ---
 
-## Step 4: Submit the Job
+## Step 2: Submit the Job
 
 Once the autoscaler logs show workers are provisioned (`PROVISION: ... ready`), submit the elastic DDP job:
 
@@ -341,7 +223,7 @@ The script calculates the minimum nodes needed based on dataset memory requireme
 
 ---
 
-## Step 5: Monitor the Job
+## Step 3: Monitor the Job
 
 Open these in **separate terminals** before or after submitting:
 
@@ -384,7 +266,7 @@ while true; do clear; oc get pods -n slurm -o wide; sleep 5; done
 
 ---
 
-## Step 6: View Results
+## Step 4: View Results
 
 ```bash
 # Find which worker was the batch host
@@ -549,83 +431,15 @@ nodeset.slinky.slurm.net/slurm-worker-slinky scaled
 ============================================================
 ```
 
-### Job Output — CPU Mode (2-node elastic)
+### Performance Reference (GPU, 4 nodes)
 
-```
-============================================================
-  ELASTIC DDP TRAINING
-============================================================
-  Job ID:       21
-  Nodes:        2 (requested: 1-4)
-  Tasks:        2
-  Node list:    slinky-[0-1]
-  Master:       slinky-0:29500
-  World Size:   2
-  Hostname:     slinky-0
-  Start time:   Wed Jun 18 19:38:08 UTC 2026
-  Requeue:      enabled
-============================================================
-
-[slinky-0] Ready after 0s (torch 2.6.0+cpu)
-[slinky-1] Ready after 0s (torch 2.6.0+cpu)
-
-############################################################
-  Slurm on OCP - Distributed Training Test
-############################################################
-  Rank 0/2 on cpu
-  Slurm Job ID: 21
-  CUDA available: False
-
-[Comm Test] all_reduce: got 1.0, expected 1.0 - PASSED
-[Bandwidth] all_reduce 32MB: 55.4ms (0.56 GB/s)
-
-============================================================
-  Training Configuration
-============================================================
-  World size:      2
-  Device:          cpu
-  Backend:         gloo
-  Model params:    9,356,554
-  Dataset size:    8,192
-  Batch size/rank: 64
-  Global batch:    128
-  Epochs:          5
-============================================================
-
-  Epoch   1/5 | Loss: 2.3479 | Throughput: 42 samples/s | Time: 97.94s
-  Epoch   2/5 | Loss: 2.3028 | Throughput: 39 samples/s | Time: 105.53s
-  Epoch   3/5 | Loss: 2.3036 | Throughput: 30 samples/s | Time: 137.59s
-  Epoch   4/5 | Loss: 2.3030 | Throughput: 38 samples/s | Time: 107.44s
-  Epoch   5/5 | Loss: 2.3028 | Throughput: 38 samples/s | Time: 107.16s
-
-============================================================
-  Training Complete
-============================================================
-  Total time:         555.66s
-  Avg throughput:     74 samples/s (global)
-  Samples processed:  40,960 (across all ranks)
-============================================================
-
-############################################################
-  TEST PASSED - All ranks completed successfully
-############################################################
-
-============================================================
-  Job completed at: Wed Jun 18 19:47:23 UTC 2026
-  Exit code:        0
-  RESULT: SUCCESS — DDP training ran across 2 node(s)
-============================================================
-```
-
-### Performance Comparison
-
-| Metric | CPU (Gloo, 2 nodes) | GPU (NCCL, 4 nodes) | Speedup |
-|--------|-----------|-----------|---------|
-| Total time | 555s | 15s | **37x** |
-| Throughput | 74 samples/s | 2,709 samples/s | **37x** |
-| Per-epoch | ~105s | ~3s | **35x** |
-| Backend | Gloo | NCCL | - |
-| Device | CPU | NVIDIA L40S (48 GB) | - |
+| Metric | Value |
+|--------|-------|
+| Total time | 15s |
+| Throughput | 2,709 samples/s (global) |
+| Per-epoch | ~3s |
+| Backend | NCCL |
+| Device | NVIDIA L40S (48 GB) |
 
 ### Job Error Log
 
@@ -755,6 +569,23 @@ oc scale nodeset slurm-worker-slinky --replicas=2 -n slurm
 
 ## Troubleshooting
 
+### Clear stuck jobs
+
+Previous jobs may be stuck with "user env retrieval failed requeued held" — a common issue in containerized Slurm where login environment resolution fails.
+
+```bash
+# Check for stuck jobs
+oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue
+
+# Cancel all stuck pending jobs (if any)
+oc exec -n slurm slurm-controller-0 -c slurmctld -- scancel --state=PENDING -u slurm
+
+# Verify queue is empty
+oc exec -n slurm slurm-controller-0 -c slurmctld -- squeue
+```
+
+**Root Cause:** Slurm tries to retrieve the user's login environment via `su -l` which fails in containers. The fix is `#SBATCH --export=ALL` in the submit script (already included).
+
 ### Scaled-up workers stuck in Pending (no GPUs available)
 
 The autoscaler increased replicas, but new pods can't schedule because the cluster has no free GPUs. You'll see `Insufficient nvidia.com/gpu` in pod events:
@@ -867,74 +698,6 @@ oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- cat /tmp/ddp-elastic-JOB_ID.
 
 ---
 
-## Advanced: Resource Exhaustion Demo (OOM)
-
-This optional section proves that a cluster with **insufficient worker pod memory** cannot run a realistic training workload — establishing the baseline problem that autoscaling solves.
-
-### Constrain Worker Memory
-
-```bash
-oc patch nodeset slurm-worker-slinky -n slurm --type='merge' -p '{
-  "spec": {
-    "slurmd": {
-      "resources": {
-        "requests": { "cpu": "1", "memory": "500Mi", "nvidia.com/gpu": "1" },
-        "limits": { "cpu": "2", "memory": "1Gi", "nvidia.com/gpu": "1" }
-      }
-    }
-  }
-}'
-```
-
-> Remove `nvidia.com/gpu` lines if your cluster doesn't have GPUs.
-
-Wait for pods to restart, then reinstall PyTorch (CPU-only — CUDA is too large for 1Gi):
-
-```bash
-for i in 0 1; do
-  oc exec -n slurm slurm-worker-slinky-$i -c slurmd -- \
-    bash -c "apt-get update -qq && apt-get install -y -qq python3-pip"
-  oc exec -n slurm slurm-worker-slinky-$i -c slurmd -- \
-    pip3 install --break-system-packages torch --index-url https://download.pytorch.org/whl/cpu
-done
-
-oc cp demos/ddp_test.py slurm/slurm-worker-slinky-0:/tmp/ddp_test.py -c slurmd
-oc cp demos/ddp_test.py slurm/slurm-worker-slinky-1:/tmp/ddp_test.py -c slurmd
-oc cp scripts/submit_job_oom.sh slurm/slurm-controller-0:/tmp/submit_job_oom.sh -c slurmctld
-```
-
-### Submit and Observe Failure
-
-```bash
-oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch /tmp/submit_job_oom.sh
-```
-
-The job uses `--intensity medium` which allocates ~1408 MB — well over the 1Gi limit. Expected error:
-
-```
-RuntimeError: unable to allocate shared memory(shm) for file: No space left on device
-```
-
-### Restore Normal Resources
-
-```bash
-oc patch nodeset slurm-worker-slinky -n slurm --type='merge' -p '{
-  "spec": {
-    "slurmd": {
-      "resources": {
-        "requests": { "cpu": "1", "memory": "2Gi", "nvidia.com/gpu": "1" },
-        "limits": { "cpu": "2", "memory": "4Gi", "nvidia.com/gpu": "1" }
-      }
-    }
-  }
-}'
-
-oc exec -n slurm slurm-controller-0 -c slurmctld -- \
-  scontrol update nodename=ALL state=resume reason="cleared"
-```
-
----
-
 ## Advanced: Manual Setup (Without Autoscaler)
 
 If you prefer to run without the autoscaler (fixed 2-node cluster, manually installed PyTorch):
@@ -957,9 +720,11 @@ For GPU workers use `https://download.pytorch.org/whl/cu124` instead. If switchi
 ```bash
 oc cp demos/ddp_test.py slurm/slurm-worker-slinky-0:/tmp/ddp_test.py -c slurmd
 oc cp demos/ddp_test.py slurm/slurm-worker-slinky-1:/tmp/ddp_test.py -c slurmd
-oc cp scripts/submit_job.sh slurm/slurm-controller-0:/tmp/submit_job.sh -c slurmctld
 
-oc exec -n slurm slurm-controller-0 -c slurmctld -- sbatch /tmp/submit_job.sh
+oc exec -n slurm slurm-controller-0 -c slurmctld -- \
+  sbatch --export=ALL --nodes=2 --ntasks=2 --ntasks-per-node=1 \
+  --output=/tmp/ddp-test-%j.out --error=/tmp/ddp-test-%j.err \
+  --wrap="srun python3 /tmp/ddp_test.py --intensity light --num-samples 8192 --epochs 5"
 ```
 
 ### View Output

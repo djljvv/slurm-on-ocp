@@ -70,9 +70,7 @@ slurm-on-ocp/
 │   ├── slurm-autoscaler.yaml    # KEDA ScaledObject + Slurm REST API for autoscaling
 │   └── slurm-values.yaml        # Optional: only for Helm-based cluster deploy (helm install slurm ... -f this)
 ├── demos/
-│   ├── ddp_test.py              # PyTorch DDP distributed training test (supports --autoscale)
-│   ├── submit_job.sh            # Slurm batch submission script (fixed nodes)
-│   └── submit_job_autoscale.sh  # Elastic submission script (--nodes=min-max, --requeue)
+│   └── ddp_test.py              # PyTorch DDP distributed training test (supports --autoscale)
 ├── docs/
 │   ├── DEPLOYMENT_GUIDE.md      # Step-by-step deployment (CLI and UI)
 │   ├── DDP_TEST_GUIDE.md        # Distributed training test guide (CPU & GPU)

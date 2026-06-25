@@ -82,7 +82,6 @@ setup_autoscaler() {
   oc create configmap slurm-autoscaler-script -n "$NAMESPACE" \
     --from-file=autoscaler.sh="${SCRIPT_DIR}/autoscaler-loop.sh" \
     --from-file=ddp_test.py="${REPO_ROOT}/demos/ddp_test.py" \
-    --from-file=submit_job.sh="${SCRIPT_DIR}/submit_job.sh" \
     --from-file=submit_job_autoscale.sh="${SCRIPT_DIR}/submit_job_autoscale.sh" \
     --dry-run=client -o yaml | oc apply -f -
 
