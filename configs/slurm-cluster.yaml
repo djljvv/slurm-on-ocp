@@ -56,10 +56,8 @@ metadata:
   name: slurm-worker-slinky
   namespace: slurm
   labels:
-    app.kubernetes.io/managed-by: Helm
     app.kubernetes.io/part-of: slurm
     app.kubernetes.io/version: '25.11'
-    helm.sh/chart: slurm-0.4.1
     nodeset.slinky.slurm.net/name: slurm-worker-slinky
 spec:
   controllerRef:
@@ -90,10 +88,8 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/managed-by: Helm
         app.kubernetes.io/part-of: slurm
         app.kubernetes.io/version: '25.11'
-        helm.sh/chart: slurm-0.4.1
         nodeset.slinky.slurm.net/name: slurm-worker-slinky
     spec:
       affinity: {}

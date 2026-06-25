@@ -115,9 +115,9 @@ check_prerequisites() {
     exit 1
   fi
   
-  # Check if helm is installed
-  if ! command -v helm &> /dev/null; then
-    log_error "helm is not installed"
+  # Check if helm is installed (only needed for operator installation)
+  if [ "$SKIP_OPERATOR" = false ] && ! command -v helm &> /dev/null; then
+    log_error "helm is not installed (required for operator install; use --skip-operator if already installed)"
     exit 1
   fi
   
@@ -505,13 +505,13 @@ main() {
   deploy_slurm_cluster
   verify_deployment
 
-  # Deploy autoscaler (setup only — no job submission)
+  # Deploy autoscaler watchdog (handles scale-down after idle)
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [ "$DRY_RUN" = true ]; then
-    log_info "[DRY RUN] Would deploy autoscaler via ./scripts/deploy-autoscale.sh --setup-only"
+    log_info "[DRY RUN] Would deploy autoscaler via ./scripts/deploy-autoscale.sh"
   elif [ -f "$SCRIPT_DIR/deploy-autoscale.sh" ]; then
     log_info "Deploying autoscaler..."
-    NAMESPACE="$NAMESPACE" "$SCRIPT_DIR/deploy-autoscale.sh" --setup-only
+    NAMESPACE="$NAMESPACE" "$SCRIPT_DIR/deploy-autoscale.sh"
     log_info "✓ Autoscaler deployed"
   else
     log_warn "Autoscaler script not found at $SCRIPT_DIR/deploy-autoscale.sh, skipping"
@@ -520,12 +520,10 @@ main() {
   log_info "Deployment completed successfully!"
   log_info ""
   log_info "Next steps:"
-  log_info "1. Wait for autoscaler to provision workers (~2-3 minutes):"
+  log_info "1. Run DDP training (auto-detects cluster, scales, submits, monitors):"
+  log_info "   python demos/ddp_test.py --launch"
+  log_info "2. Or check autoscaler watchdog logs:"
   log_info "   oc logs -n $NAMESPACE -l app.kubernetes.io/name=slurm-autoscaler -f --tail=15"
-  log_info "2. Submit a DDP training job:"
-  log_info "   oc exec -n $NAMESPACE slurm-controller-0 -c slurmctld -- sbatch /tmp/submit_job_autoscale.sh"
-  log_info "3. Or run the full end-to-end test:"
-  log_info "   ./scripts/run-autoscale-test.sh"
 }
 
 # Run main

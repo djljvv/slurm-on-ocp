@@ -1326,11 +1326,8 @@ oc delete namespace slurm
 # Complete deployment (cluster + autoscaler) in correct order
 ./scripts/deploy-slurm.sh
 
-# Run end-to-end test (light intensity, waits for completion, prints pass/fail):
-./scripts/run-autoscale-test.sh
-
-# Or submit a self-sizing job (fire-and-forget, medium intensity):
-./scripts/deploy-autoscale.sh --submit-only
+# Run DDP training (auto-detects cluster, scales, submits, monitors, retrieves results):
+python demos/ddp_test.py --launch
 ```
 
 

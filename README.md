@@ -53,10 +53,10 @@ The [Deployment Guide](docs/DEPLOYMENT_GUIDE.md) includes:
 ### DDP Test Guide
 
 The [DDP Test Guide](docs/DDP_TEST_GUIDE.md) covers:
-- Configuring GPU access for Slurm worker pods
+- **Zero-config launch**: `python demos/ddp_test.py --launch` auto-detects cluster resources and runs everything
 - Running distributed PyTorch training across Slurm-managed nodes
 - Validating NCCL/Gloo communication over the K8s network
-- Autoscaling with KEDA — elastic job submission and NodeSet scaling based on demand
+- Automatic node scaling based on workload memory requirements
 - Troubleshooting common issues
 
 ## Repository Structure
@@ -67,10 +67,10 @@ slurm-on-ocp/
 ├── QUICK_START.md               # Quick setup guide
 ├── configs/
 │   ├── slurm-cluster.yaml       # Controller + NodeSet (required): oc apply -f configs/slurm-cluster.yaml
-│   ├── slurm-autoscaler.yaml    # KEDA ScaledObject + Slurm REST API for autoscaling
+│   ├── slurm-autoscaler.yaml    # ServiceAccount, RBAC, Deployment for scale-down watchdog
 │   └── slurm-values.yaml        # Optional: only for Helm-based cluster deploy (helm install slurm ... -f this)
 ├── demos/
-│   └── ddp_test.py              # PyTorch DDP distributed training test (supports --autoscale)
+│   └── ddp_test.py              # DDP training + auto-launch orchestrator (single entry point)
 ├── docs/
 │   ├── DEPLOYMENT_GUIDE.md      # Step-by-step deployment (CLI and UI)
 │   ├── DDP_TEST_GUIDE.md        # Distributed training test guide (CPU & GPU)
@@ -78,6 +78,8 @@ slurm-on-ocp/
 │   └── ARCHITECTURE.md          # Slurm on OCP architecture
 └── scripts/
     ├── deploy-slurm.sh          # Deploy Slurm (operator + cluster)
+    ├── deploy-autoscale.sh      # Deploy scale-down watchdog (optional)
+    ├── autoscaler-loop.sh       # Scale-down watchdog loop (runs in-cluster)
     ├── cleanup-slurm.sh         # Remove Slurm resources
     └── test-slurm.sh            # Cluster tests
 ```

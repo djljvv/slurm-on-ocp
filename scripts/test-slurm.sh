@@ -141,17 +141,12 @@ if [ "$QUICK_MODE" = true ]; then
   NODE_LIST=$(oc exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -- scontrol show job "$JOB_ID" 2>/dev/null | grep "NodeList=" | awk '{print $1}' | cut -d= -f2)
   if [ -n "$NODE_LIST" ]; then
     log_info "Job ran on: $NODE_LIST"
-    # Map: slinky-0 = compute-0, slinky-1 = compute-1
-    if [ "$NODE_LIST" = "slinky-0" ]; then
-      COMPUTE_NODE="slurm-worker-slinky-0"
-    elif [ "$NODE_LIST" = "slinky-1" ]; then
-      COMPUTE_NODE="slurm-worker-slinky-1"
-    else
-      COMPUTE_NODE=""
-    fi
+    # Derive pod name from Slurm node name (slinky-N → slurm-worker-slinky-N)
+    FIRST_NODE=$(echo "$NODE_LIST" | sed 's/\[.*//;s/,.*//')
+    COMPUTE_NODE="slurm-worker-${FIRST_NODE}"
   else
-    log_warn "Could not determine node, will try both compute nodes"
-    COMPUTE_NODE=""
+    log_warn "Could not determine node, will try first compute node"
+    COMPUTE_NODE="slurm-worker-slinky-0"
   fi
   echo ""
   

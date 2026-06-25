@@ -28,7 +28,6 @@
 #      oc create configmap slurm-autoscaler-script -n slurm \
 #        --from-file=autoscaler.sh=scripts/autoscaler-loop.sh \
 #        --from-file=ddp_test.py=demos/ddp_test.py \
-#        --from-file=submit_job_autoscale.sh=scripts/submit_job_autoscale.sh \
 #        --dry-run=client -o yaml | oc apply -f -
 #
 #   2. Apply RBAC + Deployment:

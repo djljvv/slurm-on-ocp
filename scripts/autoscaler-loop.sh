@@ -1,7 +1,15 @@
 #!/bin/sh
 set -eu
 
-# --- Configuration (override via env vars in the Deployment) ---
+# Slurm NodeSet Autoscaler — Scale-Down Watchdog
+#
+# This loop runs in-cluster and handles:
+#   - Scaling DOWN after an idle period (no pending jobs)
+#   - Provisioning any newly-scaled workers with PyTorch
+#
+# Scale-UP is handled proactively by `python ddp_test.py --launch`
+# which sizes the cluster BEFORE submitting jobs.
+
 NAMESPACE="${NAMESPACE:-slurm}"
 NODESET="${NODESET:-slurm-worker-slinky}"
 CONTROLLER_POD="${CONTROLLER_POD:-slurm-controller-0}"
@@ -35,7 +43,6 @@ get_pending_info() {
 
 is_provisioned() {
   grep -qx "$1" "$PROVISIONED_FILE" 2>/dev/null || return 1
-  # Verify the pod actually has PyTorch (handles pod restarts with same name)
   kubectl exec -n "$NAMESPACE" "$1" -c slurmd -- \
     python3 -c "import torch" >/dev/null 2>&1
 }
@@ -54,15 +61,14 @@ provision_worker() {
     return 1
   fi
 
-  log "PROVISION: installing PyTorch on ${pod} (this takes a few minutes)..."
+  log "PROVISION: installing PyTorch on ${pod}..."
   if ! kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- \
     pip3 install --break-system-packages torch --index-url "$PYTORCH_INDEX" >/dev/null 2>&1; then
     log "PROVISION: WARNING: PyTorch install failed on ${pod}"
     return 1
   fi
 
-  # Use cat|exec instead of kubectl cp to follow configmap symlinks
-  for script in ddp_test.py submit_job_autoscale.sh; do
+  for script in ddp_test.py; do
     if [ -f "/scripts/${script}" ]; then
       cat "/scripts/${script}" | kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -i -- sh -c "cat > /tmp/${script}" 2>/dev/null || true
     fi
@@ -81,7 +87,6 @@ provision_new_workers() {
     -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
 
   for pod in $ready_pods; do
-    # Skip pods with a deletionTimestamp (being terminated during scale-down)
     local deleting
     deleting=$(kubectl get pod "$pod" -n "$NAMESPACE" \
       -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null)
@@ -104,31 +109,19 @@ provision_new_workers() {
   wait
 }
 
-# Also copy submit scripts to the controller
-provision_controller() {
-  log "PROVISION: copying submit scripts to controller..."
-  # Use cat|exec instead of kubectl cp to follow configmap symlinks
-  for script in submit_job_autoscale.sh; do
-    if [ -f "/scripts/${script}" ]; then
-      cat "/scripts/${script}" | kubectl exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -i -- sh -c "cat > /tmp/${script}" 2>/dev/null || true
-    fi
-  done
-  log "PROVISION: controller ready"
-}
-
 # ---- Main loop ----
-log "Slurm NodeSet Autoscaler started (with auto-provisioning)"
+log "Slurm NodeSet Autoscaler (scale-down watchdog)"
 log "  NodeSet:       $NODESET"
 log "  Min replicas:  $MIN_REPLICAS"
 log "  Max replicas:  $MAX_REPLICAS"
 log "  Poll every:    ${POLL_INTERVAL}s"
 log "  Scale-down:    after ${SCALE_DOWN_DELAY}s idle"
-log "  PyTorch index: $PYTORCH_INDEX"
 log ""
 
-log "Provisioning controller and existing workers..."
-provision_controller
+log "Provisioning any existing workers..."
 provision_new_workers
+
+PREV_REPLICAS=""
 
 while true; do
   CURRENT=$(get_current_replicas 2>/dev/null || echo "")
@@ -138,50 +131,60 @@ while true; do
     continue
   fi
 
+  # Detect external scale-up (e.g. from --launch) and reset cooldown
+  if [ -n "$PREV_REPLICAS" ] && [ "$CURRENT" -gt "$PREV_REPLICAS" ]; then
+    log "EXTERNAL SCALE-UP detected: ${PREV_REPLICAS} -> ${CURRENT} (resetting cooldown)"
+    LAST_PENDING_TIME=""
+  fi
+  PREV_REPLICAS="$CURRENT"
+
   PENDING_OUTPUT=$(get_pending_info 2>/dev/null || echo "")
 
   PENDING_COUNT=0
-  TOTAL_NODES_NEEDED=0
+  RUNNING_COUNT=0
   if [ -n "$PENDING_OUTPUT" ]; then
     PENDING_COUNT=$(echo "$PENDING_OUTPUT" | wc -l | tr -d ' ')
-    TOTAL_NODES_NEEDED=$(echo "$PENDING_OUTPUT" | awk '{s+=$2} END{print s+0}')
+  fi
+
+  # Also check for running jobs — don't scale down while jobs are active
+  RUNNING_OUTPUT=$(kubectl exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -- \
+    sh -c 'squeue -h -t RUNNING -o "%i" 2>/dev/null || echo ""' 2>/dev/null || echo "")
+  if [ -n "$RUNNING_OUTPUT" ]; then
+    RUNNING_COUNT=$(echo "$RUNNING_OUTPUT" | wc -l | tr -d ' ')
   fi
 
   NOW=$(date +%s)
 
-  if [ "$PENDING_COUNT" -gt 0 ]; then
+  if [ "$PENDING_COUNT" -gt 0 ] || [ "$RUNNING_COUNT" -gt 0 ]; then
     LAST_PENDING_TIME="$NOW"
-    DESIRED="$TOTAL_NODES_NEEDED"
-    [ "$DESIRED" -lt "$MIN_REPLICAS" ] && DESIRED="$MIN_REPLICAS"
-    [ "$DESIRED" -gt "$MAX_REPLICAS" ] && DESIRED="$MAX_REPLICAS"
-
-    if [ "$DESIRED" -gt "$CURRENT" ]; then
-      log "DEMAND: ${PENDING_COUNT} pending job(s), total need ${TOTAL_NODES_NEEDED} node(s), have ${CURRENT}"
-      scale_nodeset "$DESIRED"
+    if [ "$PENDING_COUNT" -gt 0 ]; then
+      log "ACTIVE: ${PENDING_COUNT} pending, ${RUNNING_COUNT} running (${CURRENT} replicas)"
     else
-      log "OK: ${PENDING_COUNT} pending, ${CURRENT} replicas sufficient"
+      log "BUSY: ${RUNNING_COUNT} running job(s) (${CURRENT} replicas)"
     fi
-
     provision_new_workers
   else
     if [ -n "$LAST_PENDING_TIME" ]; then
       IDLE_FOR=$((NOW - LAST_PENDING_TIME))
       if [ "$IDLE_FOR" -ge "$SCALE_DOWN_DELAY" ] && [ "$CURRENT" -gt "$MIN_REPLICAS" ]; then
-        log "IDLE: no pending jobs for ${IDLE_FOR}s, scaling down"
+        log "IDLE: no jobs for ${IDLE_FOR}s, scaling down"
         scale_nodeset "$MIN_REPLICAS"
         LAST_PENDING_TIME=""
       elif [ "$CURRENT" -gt "$MIN_REPLICAS" ]; then
         REMAINING=$((SCALE_DOWN_DELAY - IDLE_FOR))
-        log "COOLDOWN: no pending jobs, scale-down in ${REMAINING}s (${CURRENT} replicas)"
+        log "COOLDOWN: no jobs, scale-down in ${REMAINING}s (${CURRENT} replicas)"
       else
-        log "IDLE: no pending jobs, already at min (${CURRENT} replicas)"
+        log "IDLE: no jobs, already at min (${CURRENT} replicas)"
       fi
     else
       if [ "$CURRENT" -lt "$MIN_REPLICAS" ]; then
         log "BELOW MIN: have ${CURRENT}, scaling to ${MIN_REPLICAS}"
         scale_nodeset "$MIN_REPLICAS"
+      elif [ "$CURRENT" -gt "$MIN_REPLICAS" ]; then
+        LAST_PENDING_TIME="$NOW"
+        log "OVER MIN: ${CURRENT} replicas with no demand, starting cooldown"
       else
-        log "IDLE: no pending jobs (${CURRENT} replicas)"
+        log "IDLE: no jobs (${CURRENT} replicas)"
       fi
     fi
 

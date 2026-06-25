@@ -2,7 +2,7 @@
 
 ## Overview
 
-This guide walks through running **distributed PyTorch training** on Slurm-managed OpenShift pods with **automatic scaling**. The autoscaler handles provisioning workers with PyTorch, scaling the cluster to meet demand, and scaling back down when idle.
+This guide walks through running **distributed PyTorch training** on Slurm-managed OpenShift pods with **automatic scaling**. The Python training script (`ddp_test.py --launch`) handles everything: discovering the cluster, calculating resource needs, scaling nodes, provisioning workers, submitting the job, and retrieving results.
 
 ### What This Proves
 
@@ -11,98 +11,125 @@ This guide walks through running **distributed PyTorch training** on Slurm-manag
 | **Gang Scheduling** | Slurm allocates all N nodes simultaneously before starting the job |
 | **Inter-Pod Communication** | `all_reduce` works across pods over the K8s SDN |
 | **Distributed Training** | Gradient synchronization is correct (loss converges consistently) |
-| **Autoscaling** | Cluster expands/contracts based on job demand |
-| **Auto-Provisioning** | New workers get PyTorch + scripts without manual intervention |
+| **Autoscaling** | Cluster expands/contracts based on workload requirements |
+| **Zero-Config Launch** | Python auto-detects pod memory limits and calculates optimal node count |
 
 ### Architecture
 
 ```
-                         ┌──────────────┐
-                         │  User submits│
-                         │  sbatch job  │
-                         └──────┬───────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Slurm Controller (slurmctld)                               │
-│  - Queues the job, marks it PENDING if nodes unavailable    │
-│  - Elastic: --nodes=1-4 allows partial starts               │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │  Autoscaler Pod │
-              │  (polls squeue) │
-              │                 │
-              │  Pending > 0?   │
-              │  → kubectl scale│
-              │    NodeSet up   │
-              │                 │
-              │  Provisions new │
-              │  workers with   │
-              │  PyTorch + deps │
-              │                 │
-              │  Idle > 5 min?  │
-              │  → kubectl scale│
-              │    NodeSet down │
-              └────────┬────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │ Slinky Operator │
-              │ reconciles      │
-              │ NodeSet replicas│
-              └────────┬────────┘
-                       │
-          ┌────────────┼──────────────┐
-          ▼            ▼              ▼
-   ┌──────────┐ ┌──────────┐  ┌──────────┐
-   │ Worker 0 │ │ Worker 1 │  │ Worker N │
-   │ (slurmd) │ │ (slurmd) │  │ (scaled) │
-   └──────────┘ └──────────┘  └──────────┘
+┌────────────────────────────────────────────────────────────────┐
+│  User's workstation                                            │
+│                                                                │
+│  python ddp_test.py --launch                                   │
+│    1. Discovers cluster (pod mem limits, NodeSet capacity)     │
+│    2. Calculates resource plan (intensity, nodes, samples)     │
+│    3. Scales NodeSet up if needed                              │
+│    4. Provisions workers (pip, PyTorch, scripts)               │
+│    5. Submits sbatch job                                       │
+│    6. Monitors until completion                                │
+│    7. Retrieves results locally                                │
+└────────────────────────────┬───────────────────────────────────┘
+                             │ oc/kubectl
+                             ▼
+┌────────────────────────────────────────────────────────────────┐
+│  OpenShift Cluster                                             │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  Slurm Controller (slurmctld)                            │  │
+│  │  - Receives sbatch, schedules across nodes               │  │
+│  │  - Elastic: --nodes=MIN-MAX allows flexible allocation   │  │
+│  └──────────────────────┬───────────────────────────────────┘  │
+│                         │                                      │
+│            ┌────────────┼──────────────┐                       │
+│            ▼            ▼              ▼                        │
+│     ┌──────────┐ ┌──────────┐  ┌──────────┐                   │
+│     │ Worker 0 │ │ Worker 1 │  │ Worker N │                   │
+│     │ (slurmd) │ │ (slurmd) │  │ (scaled) │                   │
+│     └──────────┘ └──────────┘  └──────────┘                   │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  Autoscaler Watchdog (optional, handles scale-DOWN only) │  │
+│  │  - Scales NodeSet back to MIN after idle period          │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ### Files Reference
 
 | File | Purpose |
 |------|---------|
-| `scripts/deploy-slurm.sh` | Full deploy (cluster + autoscaler) in one command |
-| `scripts/deploy-autoscale.sh` | Setup autoscaler infra + submit self-sizing jobs |
-| `scripts/run-autoscale-test.sh` | End-to-end test (submit, wait, retrieve results, pass/fail) |
+| `demos/ddp_test.py` | DDP training script + `--launch` orchestrator (single entry point) |
+| `scripts/deploy-slurm.sh` | Deploy the Slurm cluster |
+| `scripts/deploy-autoscale.sh` | Deploy the scale-down watchdog (optional) |
 | `scripts/cleanup-slurm.sh` | Tear down cluster and autoscaler |
-| `scripts/autoscaler-loop.sh` | The polling script that runs inside the autoscaler pod |
-| `scripts/submit_job_autoscale.sh` | Self-sizing elastic batch script (calculates min nodes from dataset) |
-| `configs/slurm-autoscaler.yaml` | ServiceAccount, RBAC, and Deployment for the autoscaler pod |
+| `scripts/autoscaler-loop.sh` | Scale-down watchdog that runs inside the autoscaler pod |
+| `configs/slurm-autoscaler.yaml` | ServiceAccount, RBAC, and Deployment for the watchdog |
 | `configs/slurm-cluster.yaml` | Standard cluster config (4Gi worker memory) |
-| `demos/ddp_test.py` | DDP training script with intensity levels and `--autoscale` flag |
 
 ---
 
-## Quick Start (Scripted)
+## Quick Start
 
 If the cluster is already deployed, you can run the full DDP training test with a single command:
 
 ```bash
-# Deploy cluster + autoscaler (if not already running)
+# Deploy cluster (if not already running)
 ./scripts/deploy-slurm.sh
 
-# Run end-to-end test (submits light job, waits for completion, retrieves results, prints pass/fail)
-./scripts/run-autoscale-test.sh
+# Run DDP training — zero config, auto-detects everything:
+python demos/ddp_test.py --launch
+```
 
-# Or: setup autoscaler + submit a medium-intensity self-sizing job (fire-and-forget)
-./scripts/deploy-autoscale.sh
+That's it. The `--launch` flag discovers the cluster, calculates how many nodes are needed based on pod memory limits, scales up, provisions workers with PyTorch, submits the job, monitors it, and retrieves results locally.
 
-# Submit only (autoscaler already deployed), with custom dataset size:
-NUM_SAMPLES=12000 ./scripts/deploy-autoscale.sh --submit-only
+**Scale to more nodes** by increasing dataset size:
+
+```bash
+# Zero-config — picks intensity and node count from cluster state (default: 2 nodes)
+python demos/ddp_test.py --launch
+
+# 3-node workload
+python demos/ddp_test.py --launch --num-samples 10000
+
+# 4-node workload
+python demos/ddp_test.py --launch --num-samples 15000
+
+# 6-node workload
+python demos/ddp_test.py --launch --num-samples 25000
+```
+
+Node scaling reference (heavy intensity, 4Gi pods):
+
+| `--num-samples` | Dataset memory | Nodes needed |
+|-----------------|---------------|--------------|
+| 5,000 (default) | 2.9 GB | 2 |
+| 10,000 | 5.7 GB | 3 |
+| 15,000 | 8.6 GB | 4 |
+| 20,000 | 11.5 GB | 5 |
+| 25,000 | 14.4 GB | 6 |
+| 40,000 | 22.9 GB | 8 (max) |
+
+**Optional overrides** (normally not needed):
+
+```bash
+# Force a specific intensity level
+python demos/ddp_test.py --launch --intensity heavy
+
+# Cap at 4 nodes max
+python demos/ddp_test.py --launch --max-nodes 4
+
+# Submit without waiting for completion
+python demos/ddp_test.py --launch --no-monitor
 
 # Tear everything down when done
 ./scripts/cleanup-slurm.sh
 ```
 
-| Script | What it does | Blocks? | Retrieves results? |
-|--------|-------------|---------|-------------------|
-| `deploy-autoscale.sh` | Setup infra + submit job | No | No |
-| `run-autoscale-test.sh` | Submit light job + wait + retrieve + verdict | Yes | Yes |
+**Optional scale-down watchdog** (runs in-cluster to reclaim nodes after idle):
+
+```bash
+./scripts/deploy-autoscale.sh
+```
 
 The rest of this guide walks through each step manually for understanding and debugging.
 
@@ -113,6 +140,7 @@ The rest of this guide walks through each step manually for understanding and de
 - Slurm on OCP deployed and healthy (see [Deployment Guide](DEPLOYMENT_GUIDE.md))
 - `oc` CLI logged in with cluster access
 - At least 2 Slurm worker pods running
+- Python 3.x on your workstation (no torch needed locally — only on the cluster)
 
 ```bash
 # Verify cluster is ready
@@ -126,12 +154,84 @@ oc exec -n slurm slurm-controller-0 -c slurmctld -- sinfo
 
 ---
 
-## Step 1: Deploy the Autoscaler
+## Step 1: Launch (Automated)
 
-The autoscaler handles **everything** after this point — it installs PyTorch on workers, copies training scripts, and scales the cluster up/down based on job demand.
+The recommended way to run training:
 
 ```bash
-./scripts/deploy-autoscale.sh --setup-only
+python demos/ddp_test.py --launch
+```
+
+This executes the following phases automatically:
+
+| Phase | What happens |
+|-------|-------------|
+| **Discover** | Queries NodeSet for pod memory limits, current replicas, max capacity |
+| **Plan** | Selects intensity level, calculates dataset size that fits, determines minimum nodes |
+| **Scale** | Scales NodeSet up if more nodes are needed (waits for pods to be Ready) |
+| **Provision** | Installs pip + PyTorch on workers, copies training script |
+| **Submit** | Generates sbatch script with `--nodes=MIN-MAX`, submits to slurmctld |
+| **Monitor** | Polls `squeue` until job completes (or timeout) |
+| **Retrieve** | Pulls stdout, stderr, and training artifacts to local `results/` |
+
+Example output:
+
+```
+============================================================
+  Slurm on OCP — Auto-Launch DDP Training
+============================================================
+
+[14:30:01] Discovering cluster...
+[14:30:01]   Namespace:      slurm
+[14:30:01]   NodeSet:        slurm-worker-slinky
+[14:30:01]   Pod mem limit:  4096 MB
+[14:30:01]   Replicas:       2
+[14:30:01]   Max replicas:   8
+[14:30:01]   Workers online: 2
+
+[14:30:02] Resource plan:
+[14:30:02]   Intensity:       medium
+[14:30:02]   Num samples:     2000
+[14:30:02]   Dataset memory:  1148.4 MB
+[14:30:02]   Per-node budget: 2851.0 MB
+[14:30:02]   Nodes needed:    1-8
+[14:30:02]   Batch size:      128
+[14:30:02]   Epochs:          3
+
+[14:30:02] Ensuring cluster capacity...
+[14:30:02] Cluster has 2 replicas, need 1 — no scaling required
+
+[14:30:02] Provisioning workers...
+[14:30:02]   slurm-worker-slinky-0: PyTorch already installed, copying script...
+[14:30:03]   slurm-worker-slinky-1: PyTorch already installed, copying script...
+[14:30:03] Provisioning complete
+
+[14:30:03] Submitting training job...
+[14:30:04] Submitted batch job 42 (nodes: 1-8)
+
+[14:30:04] Monitoring job 42 (timeout: 600s)
+[14:30:14] Job 42: RUNNING (10s)
+[14:31:44] Job 42 finished
+
+[14:31:44] Retrieving results from slurm-worker-slinky-0...
+[14:31:44]   -> results/job-42.out
+[14:31:45]   -> results/job-42.err
+[14:31:45]   -> results/ddp-results/
+[14:31:45] RESULT: PASSED
+
+============================================================
+  Launch complete
+============================================================
+```
+
+---
+
+## Step 1 (Alternative): Deploy Scale-Down Watchdog
+
+If you want the cluster to automatically scale down after periods of inactivity, deploy the watchdog:
+
+```bash
+./scripts/deploy-autoscale.sh
 ```
 
 This creates:
@@ -186,40 +286,20 @@ These are set as env vars in `configs/slurm-autoscaler.yaml`.
 
 ---
 
-## Step 2: Submit the Job
+## Step 2: Submit the Job (Manual Alternative)
 
-Once the autoscaler logs show workers are provisioned (`PROVISION: ... ready`), submit the elastic DDP job:
-
-```bash
-# Default (8192 samples, medium intensity) — auto-calculates 2 nodes minimum
-oc exec -n slurm slurm-controller-0 -c slurmctld -- bash /tmp/submit_job_autoscale.sh
-# Expected: "Submitted batch job <JOB_ID>"
-```
-
-**Force autoscaling by increasing dataset size:**
+If you prefer manual control over the launch process (e.g., for debugging), you can submit directly after the autoscaler has provisioned workers:
 
 ```bash
-# 16384 samples → needs 4 nodes minimum (triggers autoscaler)
+# Submit via the Python script inside the controller
 oc exec -n slurm slurm-controller-0 -c slurmctld -- \
-  bash -c 'NUM_SAMPLES=16384 bash /tmp/submit_job_autoscale.sh'
+  python3 /tmp/ddp_test.py --intensity medium --autoscale --output-dir /tmp/ddp-results
 
-# 32768 samples → needs 7 nodes minimum
+# Or submit a raw sbatch with specific node count
 oc exec -n slurm slurm-controller-0 -c slurmctld -- \
-  bash -c 'NUM_SAMPLES=32768 bash /tmp/submit_job_autoscale.sh'
-
-# Light mode (small model, minimal memory) — 1 node is enough
-oc exec -n slurm slurm-controller-0 -c slurmctld -- \
-  bash -c 'INTENSITY=light bash /tmp/submit_job_autoscale.sh'
+  sbatch --nodes=2 --ntasks-per-node=1 --job-name=ddp-manual \
+  --wrap="srun python3 /tmp/ddp_test.py --intensity light --autoscale"
 ```
-
-The script calculates the minimum nodes needed based on dataset memory requirements and pod limits. With data sharding, each rank only loads `num_samples / world_size` images — so bigger datasets require more nodes to fit in 4Gi pod memory.
-
-| NUM_SAMPLES | Dataset total | Min nodes (4Gi pods) |
-|-------------|--------------|---------------------|
-| 8,192 | 4.7 GB | 2 |
-| 16,384 | 9.4 GB | 4 |
-| 24,576 | 14.1 GB | 5 |
-| 32,768 | 18.8 GB | 7 |
 
 ---
 
@@ -536,34 +616,25 @@ oc scale nodeset slurm-worker-slinky --replicas=2 -n slurm
 
 ### Scenario 1: Elastic start (default)
 
-1. User submits `sbatch /tmp/submit_job_autoscale.sh` (requests 1-4 nodes)
-2. Job starts immediately on the 2 available workers
-3. If more nodes later scale up for other jobs, Slurm can expand the allocation
+1. User runs `python demos/ddp_test.py --launch` (auto-calculates 1-8 nodes)
+2. Python discovers pod memory limits, determines minimum nodes needed
+3. Scales NodeSet if needed, provisions workers, submits job
+4. Job starts immediately on available workers
 
-### Scenario 2: Force multi-node (autoscale test)
+### Scenario 2: Force multi-node (heavy workload)
 
-1. User submits `sbatch --nodes=4 /tmp/submit_job_autoscale.sh` (hard 4-node requirement)
-2. Only 2 nodes exist — job stays PENDING with reason `Resources`
-3. Autoscaler detects pending job needing 4 nodes, scales NodeSet from 2 to 4
-4. New worker pods start, autoscaler installs PyTorch and copies scripts
-5. New nodes register with Slurm, job transitions to RUNNING
-6. DDP training runs across all 4 nodes
-7. After completion and 5-minute cooldown, autoscaler scales back to 2
+1. Cluster has 2 nodes with 4Gi memory pods
+2. `--launch` detects the medium intensity needs more memory than 1 node can hold
+3. Calculates min_nodes=2, submits with `--nodes=2-8`
+4. If workers need provisioning, handles that automatically
+5. DDP training runs across nodes, results retrieved locally
 
-### Scenario 3: Burst of jobs
+### Scenario 3: Scale-down after idle (watchdog)
 
-1. User submits 5 DDP jobs
-2. Autoscaler sees 5 pending jobs, scales toward max (8)
-3. Slurm distributes jobs across available nodes as they come online
-4. Jobs complete, pending count drops to 0
-5. After 5 minutes idle, autoscaler scales back to min (2)
-
-### Scenario 4: Priority preemption
-
-1. A low-priority job is running
-2. A high-priority job is submitted
-3. Slurm preempts the low-priority job (`--requeue` causes re-enqueue)
-4. Autoscaler detects both jobs pending and scales up for both to run
+1. Jobs complete, no more work is pending
+2. The scale-down watchdog (if deployed) polls squeue every 30s
+3. After 5 minutes with no pending jobs, scales NodeSet back to MIN_REPLICAS
+4. Slinky operator handles graceful pod termination
 
 ---
 
@@ -750,20 +821,29 @@ The autoscaler is a shell script (`scripts/autoscaler-loop.sh`) running in a `bi
 
 3. **Provision:** After scaling up, installs `python3-pip`, PyTorch, and copies training scripts from the ConfigMap to each new worker.
 
-4. **Readiness gate:** The `submit_job_autoscale.sh` script includes a per-rank loop that waits up to 10 minutes for PyTorch and `ddp_test.py` to appear. This allows jobs to be scheduled on nodes while they're still being provisioned.
+4. **Readiness gate:** The `--launch` mode provisions workers before submitting, so jobs don't need to wait for dependencies to appear.
 
-### What the autoscaler does NOT do
+### What the watchdog does NOT do
 
+- It does **not** handle scale-UP (that's done proactively by `--launch` before submission)
 - It does **not** use Prometheus, KEDA, or any external metrics pipeline
 - It does **not** modify Slurm configuration (partitions, nodes, etc.)
 - It does **not** drain nodes before scale-down (the Slinky operator handles graceful pod termination)
 - It does **not** persist state across restarts (provisioning status is tracked in `/tmp`)
 
-### `submit_job_autoscale.sh` — Elastic Job Submission
+### `ddp_test.py --launch` — Zero-Config Orchestrator
 
-The batch script uses `--nodes=1-4` (min-max syntax) so Slurm can start the job as soon as the minimum node count is available. The `--requeue` flag allows re-enqueue on preemption, and `--time-min` enables backfill scheduling.
+The `--launch` flag transforms the training script into a full orchestrator:
 
-### `ddp_test.py` — Training Script
+1. **Discover** — queries the NodeSet for pod memory limits and current replicas
+2. **Plan** — selects the highest intensity that fits in pod memory, calculates minimum nodes from dataset size
+3. **Scale** — calls `oc scale nodeset` if more nodes are needed, waits for Ready
+4. **Provision** — installs PyTorch on workers and copies itself to all pods
+5. **Submit** — generates an sbatch script with the right `--nodes=MIN-MAX` and submits
+6. **Monitor** — polls `squeue` until the job finishes
+7. **Retrieve** — pulls stdout, stderr, and training artifacts back locally
+
+### `ddp_test.py` — Training Script (inside the cluster)
 
 **Setup:** Auto-detects launch mode — Slurm (via `SLURM_PROCID`), torchrun (via `RANK`), or single-process fallback. Picks NCCL for GPU or Gloo for CPU, then calls `dist.init_process_group()`.
 
