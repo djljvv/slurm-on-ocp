@@ -21,7 +21,7 @@
 #   - The autoscaler pod must be schedulable (runs on any linux node)
 #
 # Deploy (one command):
-#   ./scripts/deploy-autoscale.sh --setup-only
+#   ./scripts/deploy-autoscale.sh
 #
 # Deploy (manual alternative):
 #   1. Create the ConfigMap from script files:
