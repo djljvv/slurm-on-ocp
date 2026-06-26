@@ -179,7 +179,6 @@ This will:
 # 1. Create namespace and configure security
 oc create namespace slurm 2>/dev/null || true
 oc adm policy add-scc-to-user anyuid -z default -n slurm
-oc adm policy add-scc-to-user privileged -z default -n slurm
 
 # 2. Create secrets (operator default names/keys so UI template works without editing refs)
 JWT_KEY=$(openssl rand -base64 32)
@@ -218,7 +217,7 @@ helm upgrade --install slurm \
 
 **Note:** The Helm chart typically creates a Controller whose name matches the release (e.g. `slurm`). Use `oc get controllers -n slurm` to see the exact name; then e.g. `oc describe controller slurm -n slurm`.
 
-**If using a custom values file (`slurm-values.yaml`):** Verify it does not set `runAsNonRoot: true` in the security context — `slurmd` worker pods require `privileged` access and will fail to start with this setting.
+**If using a custom values file (`slurm-values.yaml`):** Verify it does not set `runAsNonRoot: true` in the security context — `slurmd` worker pods require the `anyuid` SCC to run as the Slurm user (UID 401).
 
 **If you get version mismatch or "no matches for kind Controller" errors:**
 - Check the CRD supports v1beta1: `oc get crd controllers.slinky.slurm.net -o jsonpath='{.spec.versions[*].name}'`
@@ -251,7 +250,7 @@ slurm-worker-slinky-1         2/2     Running   0          2m
 > **Note on READY counts:** The controller pod shows `3/3` because it has sidecar containers (slurmctld, reconfigure, logfile). Worker pods show `2/2` (slurmd + logfile sidecar). If you see `1/1`, you may be running a minimal configuration without sidecars — this is also fine.
 
 **Troubleshooting Step 5:**
-- **Pods stuck in `Pending`** — Check if the `privileged` SCC was applied: `oc get pods -n slurm -o wide` and `oc describe pod <pod-name> -n slurm | grep -A5 Events`. If you see SCC-related errors, apply it: `oc adm policy add-scc-to-user privileged -z default -n slurm`
+- **Pods stuck in `Pending`** — Check if the `anyuid` SCC was applied: `oc get pods -n slurm -o wide` and `oc describe pod <pod-name> -n slurm | grep -A5 Events`. If you see SCC-related errors, apply it: `oc adm policy add-scc-to-user anyuid -z default -n slurm`
 - **Worker pods not appearing after SCC fix** — The operator may need a nudge to reconcile. Force it by annotating the NodeSet:
   ```bash
   oc annotate nodeset slurm-worker-slinky -n slurm reconcile=$(date +%s) --overwrite
@@ -431,22 +430,18 @@ oc create namespace slurm
 
 # Grant anyuid SCC (allows pods to run with the UID required by Slurm - UID 401)
 oc adm policy add-scc-to-user anyuid -z default -n slurm
-
-# Grant privileged SCC (required for slurmd worker pods)
-oc adm policy add-scc-to-user privileged -z default -n slurm
 ```
 
-> **Why both SCCs?** `anyuid` allows the controller pod to run as UID 401 (required by Slurm). `privileged` is required by `slurmd` worker pods — without it, workers will fail with: `pods "slurm-worker-slinky-0" is forbidden: unable to validate against any security context constraint`.
+> **Why anyuid?** Slurm daemons need to run as specific UIDs (e.g., UID 401 for the `slurm` user). OpenShift's default SCC restricts pods to a narrow UID range. The `anyuid` SCC grants the exception.
 
 **Via UI:**
 - Go to "Home" → "Projects"
 - Click "Create Project"
 - Name: `slurm`
 - Click "Create"
-- **Then via terminal**, grant both SCCs:
+- **Then via terminal**, grant the SCC:
   ```bash
   oc adm policy add-scc-to-user anyuid -z default -n slurm
-  oc adm policy add-scc-to-user privileged -z default -n slurm
   ```
 
 #### Step 3.2: Create Required Secrets (SECOND STEP)
@@ -849,9 +844,6 @@ oc create namespace slurm
 
 # Grant anyuid SCC to allow Slurm to run with required UID (401)
 oc adm policy add-scc-to-user anyuid -z default -n slurm
-
-# Grant privileged SCC (required for slurmd worker pods)
-oc adm policy add-scc-to-user privileged -z default -n slurm
 
 # Step 2: Create required secrets (operator default names/keys)
 JWT_KEY=$(openssl rand -base64 32)
@@ -1317,7 +1309,6 @@ oc delete controller,nodeset --all -n slurm
 oc delete statefulset,deployment,pods,svc,pvc --all -n slurm
 oc delete secret slurm-auth-jwths256 slurm-auth-slurm -n slurm
 oc adm policy remove-scc-from-user anyuid -z default -n slurm
-oc adm policy remove-scc-from-user privileged -z default -n slurm
 oc delete namespace slurm
 ```
 

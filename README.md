@@ -7,6 +7,7 @@ Complete guide for setting up and using Slurm workload manager on Red Hat OpenSh
 - **[Quick Start Guide](QUICK_START.md)** - Get Slurm on OpenShift running in a few steps
 - **[Deployment Guide](docs/DEPLOYMENT_GUIDE.md)** - Full deployment (CLI and UI)
 - **[DDP Test Guide](docs/DDP_TEST_GUIDE.md)** - Run distributed PyTorch training on Slurm (CPU & GPU)
+- **[Learning Guide](docs/Learning_guide.md)** - Deep dive into every file and how they work together
 - **[Add Nodes](docs/ADD_NODES.md)** - Add physical/virtual/containerized nodes
 - **[Architecture Guide](docs/ARCHITECTURE.md)** - Slurm on OCP architecture
 

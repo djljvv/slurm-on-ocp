@@ -1,5 +1,5 @@
 #!/bin/sh
-set -eu
+set -u
 
 # Slurm NodeSet Autoscaler — Scale-Down Watchdog
 #
@@ -12,7 +12,7 @@ set -eu
 
 NAMESPACE="${NAMESPACE:-slurm}"
 NODESET="${NODESET:-slurm-worker-slinky}"
-CONTROLLER_POD="${CONTROLLER_POD:-slurm-controller-0}"
+CONTROLLER_POD="${CONTROLLER_POD:-}"
 MIN_REPLICAS="${MIN_REPLICAS:-2}"
 MAX_REPLICAS="${MAX_REPLICAS:-8}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
@@ -20,10 +20,20 @@ SCALE_DOWN_DELAY="${SCALE_DOWN_DELAY:-300}"
 PYTORCH_INDEX="${PYTORCH_INDEX:-https://download.pytorch.org/whl/cu124}"
 
 LAST_PENDING_TIME=""
-PROVISIONED_FILE="/tmp/provisioned-workers"
-touch "$PROVISIONED_FILE"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
+
+discover_controller() {
+  local pod
+  pod=$(kubectl get pods -n "$NAMESPACE" \
+    -l app.kubernetes.io/name=slurmctld \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [ -n "$pod" ]; then
+    CONTROLLER_POD="$pod"
+  elif [ -z "$CONTROLLER_POD" ]; then
+    CONTROLLER_POD="slurm-controller-0"
+  fi
+}
 
 get_current_replicas() {
   kubectl get nodeset "$NODESET" -n "$NAMESPACE" \
@@ -42,13 +52,9 @@ get_pending_info() {
 }
 
 is_provisioned() {
-  grep -qx "$1" "$PROVISIONED_FILE" 2>/dev/null || return 1
+  # Live check only — no file cache (survives pod restarts)
   kubectl exec -n "$NAMESPACE" "$1" -c slurmd -- \
     python3 -c "import torch" >/dev/null 2>&1
-}
-
-mark_provisioned() {
-  echo "$1" >> "$PROVISIONED_FILE"
 }
 
 provision_worker() {
@@ -70,12 +76,14 @@ provision_worker() {
 
   for script in ddp_test.py; do
     if [ -f "/scripts/${script}" ]; then
-      cat "/scripts/${script}" | kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -i -- sh -c "cat > /tmp/${script}" 2>/dev/null || true
+      kubectl cp "/scripts/${script}" "${NAMESPACE}/${pod}:/tmp/${script}" -c slurmd || {
+        log "PROVISION: WARNING: failed to copy ${script} to ${pod}"
+        return 1
+      }
     fi
   done
 
   log "PROVISION: ${pod} ready"
-  mark_provisioned "$pod"
   return 0
 }
 
@@ -86,6 +94,7 @@ provision_new_workers() {
     --field-selector=status.phase=Running \
     -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
 
+  local pids=""
   for pod in $ready_pods; do
     local deleting
     deleting=$(kubectl get pod "$pod" -n "$NAMESPACE" \
@@ -104,9 +113,16 @@ provision_new_workers() {
         continue
       fi
       provision_worker "$pod" &
+      pids="$pids $!"
     fi
   done
-  wait
+
+  # Wait for all provisioners, tolerating individual failures
+  local failed=0
+  for pid in $pids; do
+    wait "$pid" || failed=$((failed + 1))
+  done
+  [ "$failed" -eq 0 ] || log "WARNING: $failed worker(s) failed provisioning"
 }
 
 # ---- Main loop ----
@@ -118,12 +134,19 @@ log "  Poll every:    ${POLL_INTERVAL}s"
 log "  Scale-down:    after ${SCALE_DOWN_DELAY}s idle"
 log ""
 
+discover_controller
+log "  Controller:    $CONTROLLER_POD"
+log ""
+
 log "Provisioning any existing workers..."
 provision_new_workers
 
 PREV_REPLICAS=""
 
 while true; do
+  # Re-discover controller each iteration in case it restarted
+  discover_controller
+
   CURRENT=$(get_current_replicas 2>/dev/null || echo "")
   if [ -z "$CURRENT" ]; then
     log "WARNING: could not read NodeSet replicas, retrying..."
@@ -143,14 +166,14 @@ while true; do
   PENDING_COUNT=0
   RUNNING_COUNT=0
   if [ -n "$PENDING_OUTPUT" ]; then
-    PENDING_COUNT=$(echo "$PENDING_OUTPUT" | wc -l | tr -d ' ')
+    PENDING_COUNT=$(printf '%s' "$PENDING_OUTPUT" | grep -c '^' 2>/dev/null || echo 0)
   fi
 
   # Also check for running jobs — don't scale down while jobs are active
   RUNNING_OUTPUT=$(kubectl exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -- \
     sh -c 'squeue -h -t RUNNING -o "%i" 2>/dev/null || echo ""' 2>/dev/null || echo "")
   if [ -n "$RUNNING_OUTPUT" ]; then
-    RUNNING_COUNT=$(echo "$RUNNING_OUTPUT" | wc -l | tr -d ' ')
+    RUNNING_COUNT=$(printf '%s' "$RUNNING_OUTPUT" | grep -c '^' 2>/dev/null || echo 0)
   fi
 
   NOW=$(date +%s)

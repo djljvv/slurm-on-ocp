@@ -65,10 +65,15 @@ log "Granting privileged SCC to autoscaler service account..."
 oc adm policy add-scc-to-user privileged -z slurm-autoscaler -n "$NAMESPACE" 2>/dev/null || true
 
 log "Waiting for autoscaler pod..."
-oc wait --for=condition=available deployment/slurm-autoscaler \
-  -n "$NAMESPACE" --timeout=120s 2>/dev/null || {
-  warn "Autoscaler may still be starting"
-}
+waited=0
+while [ $waited -lt 30 ]; do
+  if oc get pods -n "$NAMESPACE" -l app.kubernetes.io/name=slurm-autoscaler --no-headers 2>/dev/null | grep -qE "Running|ContainerCreating|Pulling"; then
+    log "Autoscaler pod is starting"
+    break
+  fi
+  sleep 3
+  waited=$((waited + 3))
+done
 
 log "Autoscaler watchdog deployed"
 echo ""

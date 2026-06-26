@@ -45,7 +45,6 @@ CERT_MANAGER_NS="cert-manager"
 SKIP_CERT_MANAGER=false
 SKIP_OPERATOR=false
 SKIP_CLUSTER=false
-VALUES_FILE=""
 DRY_RUN=false
 
 # Colors for output
@@ -80,10 +79,6 @@ while [[ $# -gt 0 ]]; do
     --skip-cluster)
       SKIP_CLUSTER=true
       shift
-      ;;
-    --values-file)
-      VALUES_FILE="$2"
-      shift 2
       ;;
     --dry-run)
       DRY_RUN=true
@@ -168,7 +163,7 @@ install_cert_manager() {
     oc wait --for=condition=ready pod \
       -l app.kubernetes.io/name=cert-manager \
       -n "$CERT_MANAGER_NS" \
-      --timeout=60s || true
+      --timeout=300s || true
   else
     log_info "[DRY RUN] Would install cert-manager"
   fi
@@ -200,19 +195,22 @@ install_slurm_operator_crds() {
   log_info "Installing Slurm Operator CRDs via Helm..."
   
   if [ "$DRY_RUN" = false ]; then
-    helm upgrade --install slurm-operator-crds \
+    local err
+    if ! err=$(helm upgrade --install slurm-operator-crds \
       oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
       --namespace "$OPERATOR_NS" \
       --create-namespace \
-      --server-side=false 2>/dev/null || \
-    helm upgrade --install slurm-operator-crds \
-      oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
-      --namespace "$OPERATOR_NS" \
-      --create-namespace || {
-        log_error "Failed to install CRDs via Helm"
-        log_info "CRDs may already exist. Check with: oc get crd | grep slinky"
-        exit 1
-      }
+      --server-side=false 2>&1); then
+      log_warn "--server-side=false failed: $err — retrying without flag"
+      helm upgrade --install slurm-operator-crds \
+        oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
+        --namespace "$OPERATOR_NS" \
+        --create-namespace || {
+          log_error "Failed to install CRDs via Helm"
+          log_info "CRDs may already exist. Check with: oc get crd | grep slinky"
+          exit 1
+        }
+    fi
     
     # Wait a moment for CRDs to be registered
     sleep 5
@@ -258,29 +256,32 @@ install_slurm_operator() {
   log_info "Installing Slurm Operator via Helm..."
   
   if [ "$DRY_RUN" = false ]; then
-    helm upgrade --install slurm-operator \
+    local err
+    if ! err=$(helm upgrade --install slurm-operator \
       oci://ghcr.io/slinkyproject/charts/slurm-operator \
       --namespace "$OPERATOR_NS" \
       --create-namespace \
       --server-side=false \
-      --wait --timeout 5m 2>/dev/null || \
-    helm upgrade --install slurm-operator \
-      oci://ghcr.io/slinkyproject/charts/slurm-operator \
-      --namespace "$OPERATOR_NS" \
-      --create-namespace \
-      --wait --timeout 5m || {
-        log_error "Failed to install Slurm Operator"
-        log_info "If operator is already installed, you may need to:"
-        log_info "  1. Check: helm list -n $OPERATOR_NS"
-        log_info "  2. Or use: --skip-operator flag"
-        exit 1
-      }
+      --wait --timeout 5m 2>&1); then
+      log_warn "--server-side=false failed: $err — retrying without flag"
+      helm upgrade --install slurm-operator \
+        oci://ghcr.io/slinkyproject/charts/slurm-operator \
+        --namespace "$OPERATOR_NS" \
+        --create-namespace \
+        --wait --timeout 5m || {
+          log_error "Failed to install Slurm Operator"
+          log_info "If operator is already installed, you may need to:"
+          log_info "  1. Check: helm list -n $OPERATOR_NS"
+          log_info "  2. Or use: --skip-operator flag"
+          exit 1
+        }
+    fi
     
     log_info "Waiting for Slurm Operator to be ready..."
     oc wait --for=condition=ready pod \
       -l app.kubernetes.io/name=slurm-operator \
       -n "$OPERATOR_NS" \
-      --timeout=90s || {
+      --timeout=300s || {
         log_error "Slurm Operator did not become ready"
         exit 1
       }
@@ -299,12 +300,11 @@ deploy_slurm_cluster() {
   
   log_info "Deploying Slurm cluster..."
   
-  # Check if operator is running (either namespace)
-  # Always use direct YAML deployment — works with both OperatorHub and Helm operators
+  # Detect operator (either namespace) — informational only, YAML deploy works with both
   if oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator 2>/dev/null | grep -q Running; then
-    log_info "Operator detected in openshift-operators (OperatorHub installation)"
+    log_info "Operator detected in openshift-operators (OperatorHub)"
   elif oc get pods -n "$OPERATOR_NS" -l app.kubernetes.io/name=slurm-operator 2>/dev/null | grep -q Running; then
-    log_info "Operator detected in $OPERATOR_NS (Helm installation)"
+    log_info "Operator detected in $OPERATOR_NS (Helm)"
   else
     log_warn "Operator not detected in openshift-operators or $OPERATOR_NS"
     log_warn "Proceeding with YAML deployment anyway (operator may be in another namespace)"
@@ -334,7 +334,7 @@ deploy_cluster_via_yaml() {
   # Create namespace if it doesn't exist
   oc create namespace "$NAMESPACE" 2>/dev/null || true
   
-  # Grant anyuid SCC
+  # Grant anyuid SCC (slurmd needs to run as specific UIDs)
   log_info "Granting anyuid SCC to default service account..."
   oc adm policy add-scc-to-user anyuid -z default -n "$NAMESPACE" 2>/dev/null || {
     log_warn "SCC may already be granted, continuing..."
@@ -368,67 +368,41 @@ deploy_cluster_via_yaml() {
     exit 1
   }
   
-  # Wait for Controller to reach Ready (slurmctld pod running and healthy)
-  log_info "Waiting for Controller to be Ready..."
-  if oc wait --for=condition=Ready controller/slurm -n "$NAMESPACE" --timeout=90s 2>/dev/null; then
-    log_info "✓ Controller is Ready"
-  else
-    log_warn "Controller did not report Ready within timeout (may still be starting)"
-    log_info "Check with: oc get controller slurm -n $NAMESPACE -o yaml"
-  fi
-  
-  # Wait for NodeSet to reach Ready (compute pods and Slurm node state)
-  log_info "Waiting for NodeSet to be Ready..."
-  if oc wait --for=condition=Ready nodeset/slurm-worker-slinky -n "$NAMESPACE" --timeout=120s 2>/dev/null; then
-    log_info "✓ NodeSet is Ready"
-  else
-    log_warn "NodeSet did not report Ready within timeout (may still be starting)"
-    log_info "Check with: oc get nodeset slurm-worker-slinky -n $NAMESPACE -o yaml"
-  fi
-  
-  log_info "✅ Cluster deployment initiated (Controller and NodeSet wait completed)"
-  log_info "Pods: oc get pods -n $NAMESPACE"
-}
-
-deploy_cluster_via_helm() {
-  log_info "Deploying cluster via Helm chart..."
-  
-  local helm_args=(
-    "oci://ghcr.io/slinkyproject/charts/slurm"
-    "--namespace" "$NAMESPACE"
-    "--create-namespace"
-  )
-  
-  if [ -n "$VALUES_FILE" ] && [ -f "$VALUES_FILE" ]; then
-    helm_args+=("--values" "$VALUES_FILE")
-    log_info "Using custom values file: $VALUES_FILE"
-  fi
-  
-  if [ "$DRY_RUN" = false ]; then
-    helm upgrade --install slurm "${helm_args[@]}" \
-      --wait --timeout 10m || {
-        log_error "Failed to deploy Slurm cluster via Helm"
-        log_warn "If operator is installed via OperatorHub, try using direct YAML deployment instead"
-        exit 1
-      }
-    
-    log_info "Waiting for Slurm cluster to be ready..."
-    sleep 10
-    
-    # Check cluster status
-    if oc get controllers -n "$NAMESPACE" &> /dev/null; then
-      log_info "Slurm cluster deployed successfully"
-      oc get controllers,nodesets -n "$NAMESPACE"
-    else
-      log_warn "Slurm cluster deployed but status check failed"
+  # Wait for pods to be Running instead of CR conditions (operator may not set them)
+  log_info "Waiting for controller pod to be Running..."
+  local waited=0
+  while [ $waited -lt 120 ]; do
+    if oc get pod slurm-controller-0 -n "$NAMESPACE" 2>/dev/null | grep -q "Running"; then
+      log_info "Controller pod is Running"
+      break
     fi
-    
-    # Show pods
-    log_info "Slurm cluster pods:"
-    oc get pods -n "$NAMESPACE"
-  else
-    log_info "[DRY RUN] Would deploy Slurm cluster with: helm install slurm ${helm_args[*]}"
+    sleep 5
+    waited=$((waited + 5))
+  done
+  if [ $waited -ge 120 ]; then
+    log_warn "Controller pod not Running after 120s (may still be pulling image)"
   fi
+
+  log_info "Waiting for worker pods to be Running..."
+  waited=0
+  while [ $waited -lt 120 ]; do
+    local running_count
+    running_count=$(oc get pods -n "$NAMESPACE" -l nodeset.slinky.slurm.net/name=slurm-worker-slinky --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+    local expected
+    expected=$(oc get nodeset slurm-worker-slinky -n "$NAMESPACE" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 2)
+    if [ "$running_count" -ge "$expected" ] 2>/dev/null; then
+      log_info "All $running_count worker pods are Running"
+      break
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  if [ $waited -ge 120 ]; then
+    log_warn "Not all worker pods Running after 120s — check: oc get pods -n $NAMESPACE"
+  fi
+  
+  log_info "Cluster deployment initiated"
+  log_info "Pods: oc get pods -n $NAMESPACE"
 }
 
 verify_deployment() {

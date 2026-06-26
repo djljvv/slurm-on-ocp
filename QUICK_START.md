@@ -28,7 +28,8 @@ The script will:
 3. Install Slurm Operator CRDs and operator (unless already present)
 4. Create the `slurm` namespace and auth secrets
 5. Deploy the Slurm cluster (Controller + NodeSet)
-6. Verify deployment
+6. Deploy the scale-down autoscaler watchdog
+7. Verify deployment
 
 ## Option B: Manual Steps
 
@@ -107,6 +108,14 @@ Or use the test script:
 
 ```bash
 ./scripts/test-slurm.sh
+```
+
+## Run DDP Training
+
+Once the cluster is up, run distributed PyTorch training (auto-detects cluster, scales nodes, provisions workers):
+
+```bash
+python demos/ddp_test.py --launch
 ```
 
 ## Next Steps

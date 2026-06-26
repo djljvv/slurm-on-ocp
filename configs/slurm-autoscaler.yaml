@@ -104,8 +104,6 @@ spec:
               value: "slurm"
             - name: NODESET
               value: "slurm-worker-slinky"
-            - name: CONTROLLER_POD
-              value: "slurm-controller-0"
             - name: MIN_REPLICAS
               value: "2"
             - name: MAX_REPLICAS
@@ -116,6 +114,13 @@ spec:
               value: "300"
             - name: PYTORCH_INDEX
               value: "https://download.pytorch.org/whl/cu124"
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - name: scripts
               mountPath: /scripts

@@ -46,6 +46,7 @@ spec:
   extraConf: |
     PartitionName=all Nodes=ALL Default=YES MaxTime=UNLIMITED State=UP
     MinJobAge=3600
+    GresTypes=gpu
 ---
 # NodeSet (Compute Nodes) - Note: requires controllerRef
 # IMPORTANT: Include image field - operator may not set it automatically
@@ -95,15 +96,27 @@ spec:
         app.kubernetes.io/version: '25.11'
         nodeset.slinky.slurm.net/name: slurm-worker-slinky
     spec:
-      affinity: {}
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 90
+              preference:
+                matchExpressions:
+                  - key: nvidia.com/gpu.present
+                    operator: In
+                    values: ["true"]
       hostname: slinky-
       imagePullSecrets: null
       initContainers: []
       nodeSelector:
         kubernetes.io/os: linux
-        nvidia.com/gpu.present: "true"
       priorityClassName: null
       tolerations:
+        # Standard NVIDIA GPU Operator taint. Adapt to your cluster's GPU taint scheme.
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        # Cluster-specific: AWS g5 and g6e instance family taints
         - key: g5-gpu
           operator: Equal
           value: "true"
@@ -116,7 +129,7 @@ spec:
         - name: dshm
           emptyDir:
             medium: Memory
-            sizeLimit: 2Gi
+            sizeLimit: 4Gi
   updateStrategy:
     rollingUpdate:
       maxUnavailable: 100%

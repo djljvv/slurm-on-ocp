@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
 
-LAUNCH_MODE = "--launch" in sys.argv
+LAUNCH_MODE = ("--launch" in sys.argv) and __name__ == "__main__"
 
 try:
     import torch
@@ -46,9 +46,17 @@ try:
 except ImportError:
     if not LAUNCH_MODE:
         raise
-    # Stubs so class definitions don't crash (never instantiated in launch mode)
+
+    class _StubModule:
+        def __init__(self, *a, **kw): pass
+        def __call__(self, *a, **kw): return self
+        def __getattr__(self, name): return _StubModule
+
     class _Stub:
         Module = object
+        Conv2d = BatchNorm2d = Linear = MaxPool2d = ReLU = Dropout = _StubModule
+        Sequential = AdaptiveAvgPool2d = _StubModule
+
     nn = _Stub()
     Dataset = object
 
@@ -233,6 +241,10 @@ def setup_distributed():
                 ["scontrol", "show", "hostname", nodelist],
                 capture_output=True, text=True
             )
+            if result.returncode != 0 or not result.stdout.strip():
+                raise RuntimeError(
+                    f"scontrol failed (rc={result.returncode}): {result.stderr.strip()}"
+                )
             os.environ["MASTER_ADDR"] = result.stdout.strip().split("\n")[0]
         if "MASTER_PORT" not in os.environ:
             os.environ["MASTER_PORT"] = "29500"
@@ -589,13 +601,13 @@ class LaunchError(Exception):
 
 
 def _run(cmd, check=True, capture=True):
-    """Run a shell command, return stdout. Raises LaunchError on failure."""
-    result = subprocess.run(
-        cmd, shell=True, capture_output=capture, text=True,
-    )
+    """Run a command, return stdout. Raises LaunchError on failure.
+    cmd must be a list of arguments (no shell interpolation)."""
+    result = subprocess.run(cmd, capture_output=capture, text=True)
     if check and result.returncode != 0:
         stderr = result.stderr.strip() if result.stderr else ""
-        raise LaunchError(f"Command failed: {cmd}\n{stderr}")
+        cmd_str = " ".join(cmd) if isinstance(cmd, list) else cmd
+        raise LaunchError(f"Command failed: {cmd_str}\n{stderr}")
     return result.stdout.strip() if capture else ""
 
 
@@ -620,35 +632,35 @@ def discover_cluster(namespace="slurm", nodeset="slurm-worker-slinky"):
     info = {"namespace": namespace, "nodeset": nodeset, "oc": oc}
 
     # Read NodeSet spec
-    mem_limit_raw = _run(
-        f"{oc} get nodeset {nodeset} -n {namespace} "
-        f"-o jsonpath='{{.spec.slurmd.resources.limits.memory}}'"
-    ).strip("'")
+    mem_limit_raw = _run([
+        oc, "get", "nodeset", nodeset, "-n", namespace,
+        "-o", "jsonpath={.spec.slurmd.resources.limits.memory}"
+    ])
     info["pod_mem_limit_mb"] = _parse_memory_to_mb(mem_limit_raw)
 
-    replicas = _run(
-        f"{oc} get nodeset {nodeset} -n {namespace} "
-        f"-o jsonpath='{{.spec.replicas}}'"
-    ).strip("'")
+    replicas = _run([
+        oc, "get", "nodeset", nodeset, "-n", namespace,
+        "-o", "jsonpath={.spec.replicas}"
+    ])
     info["current_replicas"] = int(replicas) if replicas else 2
 
     # Check autoscaler deployment for MAX_REPLICAS, fall back to 8
     try:
-        max_rep = _run(
-            f"{oc} get deployment slurm-autoscaler -n {namespace} "
-            f"-o jsonpath='{{.spec.template.spec.containers[0].env[?(@.name==\"MAX_REPLICAS\")].value}}'"
-        ).strip("'")
+        max_rep = _run([
+            oc, "get", "deployment", "slurm-autoscaler", "-n", namespace,
+            "-o", 'jsonpath={.spec.template.spec.containers[0].env[?(@.name=="MAX_REPLICAS")].value}'
+        ])
         info["max_replicas"] = int(max_rep) if max_rep else 8
     except LaunchError:
         info["max_replicas"] = 8
 
     # Discover running workers
-    workers_raw = _run(
-        f"{oc} get pods -n {namespace} "
-        f"-l nodeset.slinky.slurm.net/name={nodeset} "
-        f"--field-selector=status.phase=Running "
-        f"-o jsonpath='{{.items[*].metadata.name}}'"
-    ).strip("'")
+    workers_raw = _run([
+        oc, "get", "pods", "-n", namespace,
+        "-l", f"nodeset.slinky.slurm.net/name={nodeset}",
+        "--field-selector=status.phase=Running",
+        "-o", "jsonpath={.items[*].metadata.name}"
+    ])
     info["workers"] = workers_raw.split() if workers_raw else []
 
     # Controller pod
@@ -673,7 +685,7 @@ def _parse_memory_to_mb(mem_str):
     elif mem_str.endswith("Ki"):
         return int(float(mem_str[:-2]) / 1024)
     else:
-        return int(mem_str) // (1024 * 1024)
+        raise ValueError(f"Unrecognized Kubernetes memory format: {mem_str!r}")
 
 
 def calculate_plan(cluster_info, intensity_override=None, num_samples_override=None):
@@ -750,17 +762,17 @@ def ensure_capacity(cluster_info, plan):
         return
 
     _log(f"Scaling NodeSet: {current} -> {needed} replicas")
-    _run(f"{oc} scale nodeset {nodeset} -n {namespace} --replicas={needed}")
+    _run([oc, "scale", "nodeset", nodeset, "-n", namespace, f"--replicas={needed}"])
 
     _log("Waiting for pods to be Ready...")
     deadline = time.time() + 300
     while time.time() < deadline:
-        workers_raw = _run(
-            f"{oc} get pods -n {namespace} "
-            f"-l nodeset.slinky.slurm.net/name={nodeset} "
-            f"--field-selector=status.phase=Running "
-            f"-o jsonpath='{{.items[*].metadata.name}}'"
-        ).strip("'")
+        workers_raw = _run([
+            oc, "get", "pods", "-n", namespace,
+            "-l", f"nodeset.slinky.slurm.net/name={nodeset}",
+            "--field-selector=status.phase=Running",
+            "-o", "jsonpath={.items[*].metadata.name}"
+        ])
         ready_pods = workers_raw.split() if workers_raw else []
         if len(ready_pods) >= needed:
             cluster_info["workers"] = ready_pods
@@ -777,16 +789,14 @@ def ensure_capacity(cluster_info, plan):
     idle_nodes = []
     while time.time() < deadline:
         try:
-            sinfo_out = _run(
-                f"{oc} exec -n {namespace} {cluster_info['controller']} -c slurmctld -- "
-                f"sinfo -h -N -o '%N %T'",
-                check=False,
-            )
+            sinfo_out = _run([
+                oc, "exec", "-n", namespace, cluster_info["controller"],
+                "-c", "slurmctld", "--", "sinfo", "-h", "-N", "-o", "%N %T"
+            ], check=False)
             idle_nodes = [
                 line.split()[0] for line in sinfo_out.splitlines()
                 if line.strip() and any(s in line for s in ("idle", "mix"))
             ]
-            # Deduplicate (nodes appear once per partition)
             idle_nodes = list(set(idle_nodes))
             if len(idle_nodes) >= needed:
                 _log(f"  {len(idle_nodes)} Slurm nodes ready: {', '.join(sorted(idle_nodes))}")
@@ -804,9 +814,9 @@ def _provision_single_worker(pod, oc, namespace, script_path, pytorch_index):
     Designed to run in a thread pool for parallel provisioning."""
     # Check if already provisioned and working
     ret = subprocess.run(
-        f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-        f"python3 -c \"import torch; print(torch.__version__)\"",
-        shell=True, capture_output=True, text=True,
+        [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
+         "python3", "-c", "import torch; print(torch.__version__)"],
+        capture_output=True, text=True,
     )
     if ret.returncode == 0:
         _log(f"  {pod}: PyTorch verified ({ret.stdout.strip()}), copying script...")
@@ -816,9 +826,9 @@ def _provision_single_worker(pod, oc, namespace, script_path, pytorch_index):
         # Install pip — retry until it works
         for attempt in range(3):
             pip_ret = subprocess.run(
-                f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-                f"bash -c 'apt-get update -qq && apt-get install -y -qq python3-pip'",
-                shell=True, capture_output=True, text=True,
+                [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
+                 "bash", "-c", "apt-get update -qq && apt-get install -y -qq python3-pip"],
+                capture_output=True, text=True,
             )
             if pip_ret.returncode == 0:
                 break
@@ -830,18 +840,18 @@ def _provision_single_worker(pod, oc, namespace, script_path, pytorch_index):
         # Install PyTorch — this is the slow step
         _log(f"  {pod}: Installing PyTorch (this is the slow part)...")
         torch_ret = subprocess.run(
-            f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-            f"pip3 install --break-system-packages torch "
-            f"--index-url {pytorch_index}",
-            shell=True, capture_output=True, text=True,
+            [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
+             "pip3", "install", "--break-system-packages", "torch",
+             "--index-url", pytorch_index],
+            capture_output=True, text=True,
         )
         if torch_ret.returncode != 0:
             _log(f"  {pod}: First torch install failed, retrying...")
             torch_ret = subprocess.run(
-                f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-                f"pip3 install --break-system-packages --force-reinstall torch "
-                f"--index-url {pytorch_index}",
-                shell=True, capture_output=True, text=True,
+                [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
+                 "pip3", "install", "--break-system-packages", "--force-reinstall",
+                 "torch", "--index-url", pytorch_index],
+                capture_output=True, text=True,
             )
             if torch_ret.returncode != 0:
                 raise LaunchError(
@@ -851,22 +861,22 @@ def _provision_single_worker(pod, oc, namespace, script_path, pytorch_index):
         # Verify installation succeeded
         _log(f"  {pod}: Verifying PyTorch import...")
         verify = subprocess.run(
-            f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-            f"python3 -c \"import torch; print(torch.__version__)\"",
-            shell=True, capture_output=True, text=True,
+            [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
+             "python3", "-c", "import torch; print(torch.__version__)"],
+            capture_output=True, text=True,
         )
         if verify.returncode != 0:
             _log(f"  {pod}: WARNING — PyTorch import failed, retrying install...")
-            _run(
-                f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-                f"pip3 install --break-system-packages --force-reinstall torch "
-                f"--index-url {pytorch_index}",
-                check=False,
+            subprocess.run(
+                [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
+                 "pip3", "install", "--break-system-packages", "--force-reinstall",
+                 "torch", "--index-url", pytorch_index],
+                capture_output=True, text=True,
             )
             verify2 = subprocess.run(
-                f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-                f"python3 -c \"import torch; print(torch.__version__)\"",
-                shell=True, capture_output=True, text=True,
+                [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
+                 "python3", "-c", "import torch; print(torch.__version__)"],
+                capture_output=True, text=True,
             )
             if verify2.returncode != 0:
                 raise LaunchError(
@@ -875,7 +885,7 @@ def _provision_single_worker(pod, oc, namespace, script_path, pytorch_index):
         _log(f"  {pod}: PyTorch ready ({verify.stdout.strip() if verify.returncode == 0 else 'reinstalled'})")
 
     # Copy training script
-    _run(f"{oc} cp {script_path} {namespace}/{pod}:/tmp/ddp_test.py -c slurmd")
+    _run([oc, "cp", script_path, f"{namespace}/{pod}:/tmp/ddp_test.py", "-c", "slurmd"])
     return pod
 
 
@@ -913,9 +923,9 @@ def provision_workers(cluster_info, plan, pytorch_index="https://download.pytorc
         deadline = time.time() + 120
         while time.time() < deadline:
             ret = subprocess.run(
-                f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-                f"python3 -c \"import torch\"",
-                shell=True, capture_output=True,
+                [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
+                 "python3", "-c", "import torch"],
+                capture_output=True,
             )
             if ret.returncode == 0:
                 break
@@ -924,8 +934,8 @@ def provision_workers(cluster_info, plan, pytorch_index="https://download.pytorc
         else:
             raise LaunchError(f"{pod} failed readiness check — PyTorch not importable after 120s")
 
-    # Also copy to controller for sbatch access
-    _run(f"{oc} cp {script_path} {namespace}/{controller}:/tmp/ddp_test.py -c slurmctld")
+    # Copy to controller so users can re-submit manually via sbatch
+    _run([oc, "cp", script_path, f"{namespace}/{controller}:/tmp/ddp_test.py", "-c", "slurmctld"])
     _log("All workers verified and ready")
 
 
@@ -968,17 +978,17 @@ def submit_job(cluster_info, plan):
 
     # Write batch script via stdin pipe to avoid shell escaping issues
     write_proc = subprocess.run(
-        f"{oc} exec -n {namespace} {controller} -c slurmctld -i -- "
-        f"tee /tmp/ddp-autoscale-batch.sh",
-        shell=True, input=batch_script, capture_output=True, text=True,
+        [oc, "exec", "-n", namespace, controller, "-c", "slurmctld", "-i", "--",
+         "tee", "/tmp/ddp-autoscale-batch.sh"],
+        input=batch_script, capture_output=True, text=True,
     )
     if write_proc.returncode != 0:
         raise LaunchError(f"Failed to write batch script: {write_proc.stderr}")
 
-    output = _run(
-        f"{oc} exec -n {namespace} {controller} -c slurmctld -- "
-        f"sbatch /tmp/ddp-autoscale-batch.sh"
-    )
+    output = _run([
+        oc, "exec", "-n", namespace, controller, "-c", "slurmctld", "--",
+        "sbatch", "/tmp/ddp-autoscale-batch.sh"
+    ])
 
     for word in output.split():
         if word.isdigit():
@@ -1000,11 +1010,10 @@ def monitor_job(cluster_info, job_id, timeout=600):
 
     while (time.time() - start) < timeout:
         try:
-            state = _run(
-                f"{oc} exec -n {namespace} {controller} -c slurmctld -- "
-                f"squeue -j {job_id} -h -o '%T'",
-                check=False,
-            ).strip().strip("'")
+            state = _run([
+                oc, "exec", "-n", namespace, controller, "-c", "slurmctld", "--",
+                "squeue", "-j", str(job_id), "-h", "-o", "%T"
+            ], check=False).strip()
         except LaunchError:
             state = ""
 
@@ -1034,11 +1043,10 @@ def retrieve_results(cluster_info, job_id):
 
     # Find which host ran the job
     try:
-        batch_host = _run(
-            f"{oc} exec -n {namespace} {controller} -c slurmctld -- "
-            f"scontrol show job {job_id}",
-            check=False,
-        )
+        batch_host = _run([
+            oc, "exec", "-n", namespace, controller, "-c", "slurmctld", "--",
+            "scontrol", "show", "job", str(job_id)
+        ], check=False)
         host = ""
         for line in batch_host.splitlines():
             if "BatchHost=" in line:
@@ -1056,11 +1064,10 @@ def retrieve_results(cluster_info, job_id):
     # Job stdout
     out_file = results_dir / f"job-{job_id}.out"
     try:
-        content = _run(
-            f"{oc} exec -n {namespace} {batch_pod} -c slurmd -- "
-            f"cat /tmp/ddp-autoscale-{job_id}.out",
-            check=False,
-        )
+        content = _run([
+            oc, "exec", "-n", namespace, batch_pod, "-c", "slurmd", "--",
+            "cat", f"/tmp/ddp-autoscale-{job_id}.out"
+        ], check=False)
         if content:
             out_file.write_text(content)
             _log(f"  -> {out_file}")
@@ -1070,11 +1077,10 @@ def retrieve_results(cluster_info, job_id):
     # Job stderr
     err_file = results_dir / f"job-{job_id}.err"
     try:
-        content = _run(
-            f"{oc} exec -n {namespace} {batch_pod} -c slurmd -- "
-            f"cat /tmp/ddp-autoscale-{job_id}.err",
-            check=False,
-        )
+        content = _run([
+            oc, "exec", "-n", namespace, batch_pod, "-c", "slurmd", "--",
+            "cat", f"/tmp/ddp-autoscale-{job_id}.err"
+        ], check=False)
         if content:
             err_file.write_text(content)
             _log(f"  -> {err_file}")
@@ -1083,11 +1089,10 @@ def retrieve_results(cluster_info, job_id):
 
     # Training artifacts
     try:
-        _run(
-            f"{oc} cp {namespace}/{batch_pod}:/tmp/ddp-results "
-            f"{results_dir}/ddp-results -c slurmd",
-            check=False,
-        )
+        _run([
+            oc, "cp", f"{namespace}/{batch_pod}:/tmp/ddp-results",
+            f"{results_dir}/ddp-results", "-c", "slurmd"
+        ], check=False)
         if (results_dir / "ddp-results").exists():
             _log(f"  -> {results_dir}/ddp-results/")
     except LaunchError:

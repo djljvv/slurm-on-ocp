@@ -23,9 +23,6 @@ test-output/
 # Training results (local only)
 results/
 
-# Local notes
-docs/Learning_guide.md
-
 # Secrets and keys (never commit!)
 *.key
 *.pem
