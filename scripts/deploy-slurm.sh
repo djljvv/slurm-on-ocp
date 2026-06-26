@@ -25,6 +25,9 @@
 #   --skip-operator          Skip operator installation (assumes already installed)
 #   --skip-cluster           Skip cluster deployment (only install operator)
 #   --dry-run                Show what would be done without executing
+#
+# Cluster is always deployed via direct YAML (configs/slurm-cluster.yaml).
+# Edit that file to customize resources, GPU settings, replicas, etc.
 # 
 # Note: If CRDs are already installed via OperatorHub, the script will automatically
 #       detect and skip CRD installation. You don't need to do anything manually.

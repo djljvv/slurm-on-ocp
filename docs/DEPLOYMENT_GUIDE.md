@@ -26,7 +26,7 @@ You will see two projects/namespaces. **Both are needed;** they have different r
 ```bash
 # 1. Verify you're logged in to OpenShift
 oc whoami
-# Should show: pvuda@redhat.com
+# Should show your username (e.g., admin or kube:admin)
 
 # 2. Verify cluster access
 oc get nodes
@@ -299,7 +299,7 @@ oc exec -n slurm slurm-worker-slinky-1 -c slurmd -- cat /tmp/test.out
 
 ### Prerequisites
 
-1. Access to OpenShift Web Console: `console-openshift-console.apps.ai-dev02.kni.syseng.devcluster.openshift.com`
+1. Access to OpenShift Web Console: `console-openshift-console.apps.<your-cluster-domain>`
 2. Cluster admin privileges
 3. Browser with access to the cluster
 
@@ -644,10 +644,6 @@ metadata:
   name: slurm-worker-slinky
   namespace: slurm
   labels:
-    app.kubernetes.io/managed-by: Helm
-    app.kubernetes.io/part-of: slurm
-    app.kubernetes.io/version: '25.11'
-    helm.sh/chart: slurm-0.4.1
     nodeset.slinky.slurm.net/name: slurm-worker-slinky
 spec:
   controllerRef:
@@ -670,16 +666,15 @@ spec:
         value: '0'
       - name: POD_MEMORY
         value: '0'
+    volumeMounts:
+      - name: dshm
+        mountPath: /dev/shm
   logfile:
     image: 'docker.io/library/alpine:latest'
     resources: {}
   template:
     metadata:
       labels:
-        app.kubernetes.io/managed-by: Helm
-        app.kubernetes.io/part-of: slurm
-        app.kubernetes.io/version: '25.11'
-        helm.sh/chart: slurm-0.4.1
         nodeset.slinky.slurm.net/name: slurm-worker-slinky
     spec:
       affinity: {}
@@ -690,7 +685,11 @@ spec:
         kubernetes.io/os: linux
       priorityClassName: null
       tolerations: []
-      volumes: []
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
   updateStrategy:
     rollingUpdate:
       maxUnavailable: 100%
@@ -897,6 +896,7 @@ oc wait --for=condition=Ready controller/slurm -n slurm --timeout=300s 2>/dev/nu
 # If wait fails (e.g. condition not supported), just wait for pods: oc get pods -n slurm -w
 
 # Step 5: Create NodeSet (OCP default name: slurm-worker-slinky; controllerRef.name must match Controller: slurm)
+# IMPORTANT: Include the image field — operator may not set it automatically
 oc apply -f - <<EOF
 apiVersion: slinky.slurm.net/v1beta1
 kind: NodeSet
@@ -909,6 +909,7 @@ spec:
     namespace: slurm
   replicas: 2
   slurmd:
+    image: 'ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04'
     resources:
       requests:
         cpu: "1"
@@ -932,19 +933,18 @@ oc get pods -n slurm
 
 ```bash
 # 1. Login to OpenShift
-oc login https://api.ai-dev02.kni.syseng.devcluster.openshift.com:6443
+oc login https://api.<your-cluster-domain>:6443
 
 # 2. Run deployment script (from your repo root)
-cd /path/to/slurm
+cd /path/to/slurm-on-ocp
 ./scripts/deploy-slurm.sh --skip-operator
-# Or with custom values: ./scripts/deploy-slurm.sh --skip-operator --values-file configs/slurm-values.yaml
 
 # 3. Wait for deployment (script handles this)
 ```
 
 ### Phase 2: Verification (Browser UI)
 
-1. Open browser: `console-openshift-console.apps.ai-dev02.kni.syseng.devcluster.openshift.com`
+1. Open browser: `console-openshift-console.apps.<your-cluster-domain>`
 2. Navigate to "Workloads" → "Pods" → Filter: `slurm`
 3. Verify all pods are "Running"
 4. Check "Operators" → "Installed Operators" → "Slurm Operator"

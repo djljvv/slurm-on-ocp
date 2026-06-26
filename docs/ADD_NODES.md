@@ -124,17 +124,19 @@ echo "Service: $CONTROLLER_SVC, IP: $CONTROLLER_IP"
 **Use the provided scripts to get this information:**
 
 ```bash
-# 1. Controller address and port
-./scripts/get-controller-address.sh
+# 1. Controller address (service DNS within the cluster)
+oc get svc -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}'
+# External: use LoadBalancer or port-forward (see Network section)
 
-# 2. See which worker nodes host Slurm pods
-./scripts/show-slurm-placement.sh
+# 2. See which OCP nodes host Slurm worker pods
+oc get pods -n slurm -o wide | grep worker
 
-# 3. Munge key (extract from controller pod - see Step 3 for details)
-# Note: Munge key extraction has permission issues - see Step 3 for solutions
+# 3. Auth keys (Slinky uses JWT, not munge)
+# JWT and Slurm keys are in secrets: slurm-auth-jwths256, slurm-auth-slurm
+oc get secret slurm-auth-jwths256 -n slurm -o jsonpath='{.data.jwt_hs256\.key}' | base64 -d
 
-# 4. Slurm configuration
-oc get configmap slurm-config -n slurm -o jsonpath='{.data.slurm\.conf}'
+# 4. Slurm configuration (stored in controller PVC, not a ConfigMap)
+oc exec -n slurm slurm-controller-0 -c slurmctld -- cat /etc/slurm/slurm.conf
 
 # 5. Standard network ports:
 #    - 6817: slurmctld (controller)
@@ -155,8 +157,8 @@ oc get configmap slurm-config -n slurm -o jsonpath='{.data.slurm\.conf}'
 oc get nodes
 
 # 2. Scale NodeSet UP (add more compute nodes)
-oc scale nodeset slurm-compute --replicas=4 -n slurm
-# Or: oc edit nodeset slurm-compute -n slurm  # Change spec.replicas
+oc scale nodeset slurm-worker-slinky --replicas=4 -n slurm
+# Or: oc edit nodeset slurm-worker-slinky -n slurm  # Change spec.replicas
 
 # 3. Verify new pods
 oc get pods -n slurm -l app.kubernetes.io/name=slurmd -w
@@ -168,8 +170,8 @@ oc exec -n slurm $CONTROLLER_POD -c slurmctld -- \
   sbatch --wrap="hostname && echo 'Running on new node'" --output=/tmp/test.out
 
 # 5. Scale NodeSet DOWN (remove compute nodes)
-oc scale nodeset slurm-compute --replicas=2 -n slurm
-# Or: oc edit nodeset slurm-compute -n slurm  # Change spec.replicas to desired number
+oc scale nodeset slurm-worker-slinky --replicas=2 -n slurm
+# Or: oc edit nodeset slurm-worker-slinky -n slurm  # Change spec.replicas to desired number
 
 # Verify pods are being terminated
 oc get pods -n slurm -l app.kubernetes.io/name=slurmd -w
@@ -182,13 +184,13 @@ oc get pods -n slurm -l app.kubernetes.io/name=slurmd -w
 apiVersion: slinky.slurm.net/v1beta1
 kind: NodeSet
 metadata:
-  name: slurm-compute
+  name: slurm-worker-slinky
   namespace: slurm
 spec:
   template:
     spec:
       nodeSelector:
-        slurm-compute: "true"
+        nvidia.com/gpu.present: "true"
         kubernetes.io/os: linux
 ```
 
@@ -225,17 +227,35 @@ LoadBalancer provides an external IP that works from any network location.
 
 **Step 1: Check LoadBalancer Support**
 ```bash
-./scripts/check-loadbalancer-support.sh
+# Check if MetalLB or cloud LB controller is available
+oc get pods -A | grep -i metallb || oc get pods -A | grep -i load-balancer
 ```
 
 **Step 2: Create LoadBalancer Service**
 ```bash
-./scripts/create-loadbalancer-service.sh
+oc apply -f - <<EOF
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurm-controller-external
+  namespace: slurm
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: slurmctld
+  ports:
+    - name: slurmctld
+      port: 6817
+      targetPort: 6817
+    - name: slurmd
+      port: 6818
+      targetPort: 6818
+EOF
 ```
 
 **Step 3: Get Controller Address**
 ```bash
-./scripts/get-controller-address.sh
+oc get svc slurm-controller-external -n slurm -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
 ```
 
 **Step 4: Test Connectivity (from physical node)**
@@ -258,18 +278,17 @@ sudo firewall-cmd --permanent --add-port={6817,6818,28596}/tcp && sudo firewall-
 
 Use this if LoadBalancer is not available or not working.
 
-**Step 1: Start Port Forward (on your Mac/terminal with oc access)**
+**Step 1: Start Port Forward (on your workstation with oc access)**
 ```bash
-./scripts/port-forward-controller.sh
-# Or manually:
 oc port-forward --address 0.0.0.0 -n slurm svc/slurm-controller 6817:6817
 ```
 
-**Step 2: Get Your Mac's IP Address**
+**Step 2: Get Your Workstation's IP Address**
 ```bash
-./scripts/test-mac-connectivity.sh
-# Or manually:
-ipconfig getifaddr en0  # macOS Wi-Fi
+# Linux
+hostname -I | awk '{print $1}'
+# macOS
+ipconfig getifaddr en0
 ```
 
 **Step 3: Test Connectivity (from physical node)**
@@ -408,8 +427,8 @@ Add more Slurm compute pods within OpenShift.
 ### Method 1: Scale Existing NodeSet
 
 ```bash
-oc scale nodeset slurm-compute --replicas=6 -n slurm
-# Or: oc edit nodeset slurm-compute -n slurm  # Change spec.replicas
+oc scale nodeset slurm-worker-slinky --replicas=6 -n slurm
+# Or: oc edit nodeset slurm-worker-slinky -n slurm  # Change spec.replicas
 ```
 
 ### Method 2: Create Additional NodeSet
@@ -532,13 +551,12 @@ spec:
 
 **Option 1: LoadBalancer Service** (Recommended - Works from any network)
 
-**Use the provided script:**
 ```bash
 # Check if LoadBalancer is supported
-./scripts/check-loadbalancer-support.sh
+oc get pods -A | grep -i metallb || oc get pods -A | grep -i load-balancer
 
-# Create LoadBalancer service (provides external IP)
-./scripts/create-loadbalancer-service.sh
+# Create LoadBalancer service (see Option 1 in Scenario 2 above for full YAML)
+oc get svc slurm-controller-external -n slurm
 ```
 
 **When to use LoadBalancer:**
@@ -549,13 +567,12 @@ spec:
 
 **Option 2: Port Forwarding** (Temporary Workaround)
 
-**Use the provided script:**
 ```bash
-# Start port forwarding (on Mac/terminal with oc access)
-./scripts/port-forward-controller.sh
+# Start port forwarding (on workstation with oc access)
+oc port-forward --address 0.0.0.0 -n slurm svc/slurm-controller 6817:6817
 
-# Get your Mac's IP
-./scripts/test-mac-connectivity.sh
+# Get your workstation IP for the external node to connect to
+hostname -I | awk '{print $1}'
 ```
 
 **When to use Port Forwarding:**
@@ -566,7 +583,7 @@ spec:
 
 **To see which worker nodes host Slurm pods:**
 ```bash
-./scripts/show-slurm-placement.sh
+oc get pods -n slurm -o wide | grep worker
 ```
 
 **DNS Configuration** (Optional - for internal cluster DNS):
@@ -602,7 +619,7 @@ DefCpuPerNode=2  # Reserve 2 CPUs for system
 
 ```ini
 # Separate partitions by node type
-PartitionName=container Nodes=slurm-compute-[0-5] Default=YES MaxTime=24:00:00 State=UP
+PartitionName=container Nodes=slinky-[0-5] Default=YES MaxTime=24:00:00 State=UP
 PartitionName=physical Nodes=physical-node1,physical-node2 Default=NO MaxTime=INFINITE State=UP
 PartitionName=virtual Nodes=vm-node1,vm-node2 Default=NO MaxTime=48:00:00 State=UP
 ```

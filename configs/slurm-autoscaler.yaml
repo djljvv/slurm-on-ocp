@@ -1,19 +1,18 @@
-# Slurm NodeSet Autoscaler — Direct Polling with Auto-Provisioning
+# Slurm NodeSet Autoscaler — Scale-Down Watchdog + Worker Provisioner
 #
-# Scales the Slurm worker NodeSet by polling squeue for pending jobs,
-# then automatically provisions new workers with PyTorch and training scripts.
+# Monitors idle workers and scales the NodeSet back to MIN_REPLICAS when
+# no jobs are running. Also provisions PyTorch on newly scaled-up workers.
 #
 # How it works:
 #   1. Every POLL_INTERVAL seconds, exec into slurmctld and run `squeue`
-#   2. Count pending jobs and the max nodes requested by any single job
-#   3. Scale the NodeSet up if there's unmet demand, down if idle
-#   4. After scale-up, wait for new pods to be Ready
-#   5. Install PyTorch and copy training scripts to new workers
-#   6. The Slinky operator handles pod lifecycle (drain before scale-in)
+#   2. If no pending/running jobs for SCALE_DOWN_DELAY seconds, scale down
+#   3. After any scale-up (triggered externally by `ddp_test.py --launch`),
+#      detect new pods and provision them with PyTorch + training scripts
+#   4. The Slinky operator handles pod lifecycle (drain before scale-in)
 #
 # Scaling behavior:
-#   Pending jobs requesting more nodes than available → scale up + provision
-#   No pending jobs for SCALE_DOWN_DELAY seconds     → scale toward MIN_REPLICAS
+#   Scale-UP:   Handled by `python demos/ddp_test.py --launch` (not this watchdog)
+#   Scale-DOWN: No jobs for SCALE_DOWN_DELAY seconds → scale toward MIN_REPLICAS
 #   Never scales below MIN_REPLICAS or above MAX_REPLICAS
 #
 # Prerequisites:

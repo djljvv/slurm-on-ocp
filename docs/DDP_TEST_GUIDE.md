@@ -214,7 +214,7 @@ while true; do clear; oc get pods -n slurm -o wide; sleep 5; done
 oc exec -n slurm slurm-controller-0 -c slurmctld -- scontrol show job JOB_ID | grep BatchHost
 
 # Read output (on batch host, usually worker-0)
-oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- cat /tmp/ddp-elastic-JOB_ID.out
+oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- cat /tmp/ddp-autoscale-JOB_ID.out
 
 # Copy training artifacts locally
 oc cp slurm/slurm-worker-slinky-0:/tmp/ddp-results results/ -c slurmd
@@ -269,7 +269,7 @@ Results saved per run:
 
 ```
 [Comm Test] all_reduce: got 6.0, expected 6.0 - PASSED
-[Bandwidth] all_reduce 64MB: 145.3ms (0.43 GB/s)
+[Bandwidth] all_reduce 64MB: 127.0ms (0.49 GB/s)
 
 ============================================================
   Training Configuration
@@ -281,39 +281,53 @@ Results saved per run:
   Model:           SmallCNN
   Model params:    9,356,554
   Dataset size:    8,192
+  Batch size/rank: 64
   Global batch:    256
+  Num workers:     2
   Epochs:          5
 ============================================================
 
-  Epoch   1/5 | Loss: 2.3439 | Throughput: 431 samples/s | Time: 4.75s
-  Epoch   2/5 | Loss: 2.3038 | Throughput: 799 samples/s | Time: 2.56s
-  Epoch   3/5 | Loss: 2.3022 | Throughput: 770 samples/s | Time: 2.66s
-  Epoch   4/5 | Loss: 2.3029 | Throughput: 798 samples/s | Time: 2.57s
-  Epoch   5/5 | Loss: 2.3034 | Throughput: 795 samples/s | Time: 2.58s
+  Epoch   1/5 | Loss: 2.3335 | Throughput: 562 samples/s | Time: 3.65s | RSS: 1384MB
+  Epoch   2/5 | Loss: 2.3031 | Throughput: 771 samples/s | Time: 2.66s | RSS: 1385MB
+  Epoch   3/5 | Loss: 2.3042 | Throughput: 785 samples/s | Time: 2.61s | RSS: 1385MB
+  Epoch   4/5 | Loss: 2.3027 | Throughput: 768 samples/s | Time: 2.67s | RSS: 1385MB
+  Epoch   5/5 | Loss: 2.3026 | Throughput: 773 samples/s | Time: 2.65s | RSS: 1385MB
 
 ============================================================
-  Training Complete — 15.12s, 2709 samples/s (global)
+  Training Complete
+============================================================
+  Total time:         14.23s
+  Avg throughput:     2879 samples/s (global)
+  Samples processed:  40,960 (across all ranks)
 ============================================================
 
-  Autoscaling Report:
-    Scaling efficiency:  166.7%
-    Recommendation:      SCALE UP - adding nodes would increase throughput
-    GPU memory usage:    0.3%
-    Process RSS:         1384 MB
+============================================================
+  Autoscaling Report
+============================================================
+  Current world size:     4
+  Per-rank throughput:    732 samples/s
+  Global throughput:      2927 samples/s
+  Communication overhead: -30.3% (first epoch vs steady state)
+  Slurm job:              33
+  Allocated nodes:        4
+  Recommendation:         SCALE UP  - Minimal communication overhead, more nodes would help
+  GPU memory utilization: 0.3%
+  Process RSS:            1383 MB
+============================================================
 
   TEST PASSED - All ranks completed successfully
 ```
 
-### Autoscaler Watchdog Log (scale-up then scale-down)
+### Autoscaler Watchdog Log (scale-down after idle)
+
+The watchdog only handles scale-down (scale-up is done by `ddp_test.py --launch`):
 
 ```
-[13:34:34] DEMAND: 1 pending job(s), total need 4 node(s), have 2
-[13:34:34] SCALING: slurm-worker-slinky -> 4 replicas
-[13:35:29] PROVISION: installing PyTorch on slurm-worker-slinky-2...
-[13:37:35] PROVISION: slurm-worker-slinky-2 ready
-[13:38:05] COOLDOWN: no pending jobs, scale-down in 89s (4 replicas)
-[13:39:58] IDLE: no pending jobs for 324s, scaling down
-[13:39:58] SCALING: slurm-worker-slinky -> 2 replicas
+[19:38:05] POLL: 0 pending, 0 running — idle timer started (4 replicas)
+[19:39:05] POLL: 0 pending, 0 running — idle 60s / 300s
+[19:42:05] POLL: 0 pending, 0 running — idle 240s / 300s
+[19:43:05] IDLE: no jobs for 300s, scaling down
+[19:43:05] SCALING: slurm-worker-slinky -> 2 replicas
 ```
 
 ### Key Metrics
@@ -321,7 +335,7 @@ Results saved per run:
 - **Throughput**: GPU ~400-1000 samples/s per rank, CPU ~40 samples/s
 - **Bandwidth**: 0.5-1 GB/s over K8s SDN (InfiniBand would be 10-50 GB/s)
 - **Loss**: Should decrease across epochs (proves gradient sync is correct)
-- **Scaling efficiency**: > 100% means adding more nodes would improve throughput
+- **Communication overhead**: Low % means DDP comms are cheap relative to compute; negative values mean steady-state is faster than first epoch (DDP bucket rebuilding overhead amortizes)
 
 The `.err` file should only contain `UserWarning: Failed to initialize NumPy` — harmless.
 

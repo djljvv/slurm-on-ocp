@@ -75,8 +75,9 @@ echo ""
 if oc get namespace "$NAMESPACE" &>/dev/null; then
   log_info "Cleaning cluster namespace: $NAMESPACE"
 
+  REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
   log_info "Deleting autoscaler (if deployed)..."
-  run_ignore oc delete -f configs/slurm-autoscaler.yaml --ignore-not-found --timeout=30s
+  run_ignore oc delete -f "$REPO_ROOT/configs/slurm-autoscaler.yaml" --ignore-not-found --timeout=30s
   run_ignore oc delete configmap slurm-autoscaler-script -n "$NAMESPACE" --ignore-not-found --timeout=30s
 
   log_info "Deleting Controller and NodeSet (custom resources)..."

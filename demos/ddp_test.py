@@ -28,6 +28,7 @@ import math
 import argparse
 import subprocess
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
@@ -327,7 +328,7 @@ def train(rank, world_size, device, args):
     if args.intensity == "light":
         dataset = OnTheFlyDataset(num_samples=args.num_samples, image_size=32, num_classes=10)
         model = SmallCNN(num_classes=10).to(device)
-        num_workers = 2
+        default_workers = 2
         use_sampler = True
     else:
         image_size = 224
@@ -340,8 +341,23 @@ def train(rank, world_size, device, args):
             world_size=world_size,
         )
         model = ResNet18(num_classes=num_classes).to(device)
-        num_workers = 0
+        default_workers = 0
         use_sampler = False
+
+    num_workers = args.num_workers if args.num_workers is not None else default_workers
+
+    if num_workers > 0:
+        shm_path = "/dev/shm"
+        try:
+            shm_stats = os.statvfs(shm_path)
+            shm_avail_mb = (shm_stats.f_bavail * shm_stats.f_frsize) / (1024 * 1024)
+            if shm_avail_mb < 512:
+                if rank == 0:
+                    print(f"  [Warning] /dev/shm only {shm_avail_mb:.0f} MB — "
+                          f"falling back to num_workers=0 to avoid Bus errors", flush=True)
+                num_workers = 0
+        except OSError:
+            pass
 
     if rank == 0:
         rss = get_host_memory_mb()
@@ -783,93 +799,113 @@ def ensure_capacity(cluster_info, plan):
     raise LaunchError(f"Timed out waiting for {needed} nodes to register with Slurm")
 
 
+def _provision_single_worker(pod, oc, namespace, script_path, pytorch_index):
+    """Provision a single worker pod with PyTorch and the training script.
+    Designed to run in a thread pool for parallel provisioning."""
+    # Check if already provisioned and working
+    ret = subprocess.run(
+        f"{oc} exec -n {namespace} {pod} -c slurmd -- "
+        f"python3 -c \"import torch; print(torch.__version__)\"",
+        shell=True, capture_output=True, text=True,
+    )
+    if ret.returncode == 0:
+        _log(f"  {pod}: PyTorch verified ({ret.stdout.strip()}), copying script...")
+    else:
+        _log(f"  {pod}: Installing pip + PyTorch (this takes a few minutes)...")
+
+        # Install pip — retry until it works
+        for attempt in range(3):
+            pip_ret = subprocess.run(
+                f"{oc} exec -n {namespace} {pod} -c slurmd -- "
+                f"bash -c 'apt-get update -qq && apt-get install -y -qq python3-pip'",
+                shell=True, capture_output=True, text=True,
+            )
+            if pip_ret.returncode == 0:
+                break
+            _log(f"  {pod}: pip install attempt {attempt+1} failed, retrying in 15s...")
+            time.sleep(15)
+        else:
+            raise LaunchError(f"Failed to install pip on {pod}: {pip_ret.stderr.strip()}")
+
+        # Install PyTorch — this is the slow step
+        _log(f"  {pod}: Installing PyTorch (this is the slow part)...")
+        torch_ret = subprocess.run(
+            f"{oc} exec -n {namespace} {pod} -c slurmd -- "
+            f"pip3 install --break-system-packages torch "
+            f"--index-url {pytorch_index}",
+            shell=True, capture_output=True, text=True,
+        )
+        if torch_ret.returncode != 0:
+            _log(f"  {pod}: First torch install failed, retrying...")
+            torch_ret = subprocess.run(
+                f"{oc} exec -n {namespace} {pod} -c slurmd -- "
+                f"pip3 install --break-system-packages --force-reinstall torch "
+                f"--index-url {pytorch_index}",
+                shell=True, capture_output=True, text=True,
+            )
+            if torch_ret.returncode != 0:
+                raise LaunchError(
+                    f"PyTorch installation failed on {pod}: {torch_ret.stderr[-500:]}"
+                )
+
+        # Verify installation succeeded
+        _log(f"  {pod}: Verifying PyTorch import...")
+        verify = subprocess.run(
+            f"{oc} exec -n {namespace} {pod} -c slurmd -- "
+            f"python3 -c \"import torch; print(torch.__version__)\"",
+            shell=True, capture_output=True, text=True,
+        )
+        if verify.returncode != 0:
+            _log(f"  {pod}: WARNING — PyTorch import failed, retrying install...")
+            _run(
+                f"{oc} exec -n {namespace} {pod} -c slurmd -- "
+                f"pip3 install --break-system-packages --force-reinstall torch "
+                f"--index-url {pytorch_index}",
+                check=False,
+            )
+            verify2 = subprocess.run(
+                f"{oc} exec -n {namespace} {pod} -c slurmd -- "
+                f"python3 -c \"import torch; print(torch.__version__)\"",
+                shell=True, capture_output=True, text=True,
+            )
+            if verify2.returncode != 0:
+                raise LaunchError(
+                    f"PyTorch installation failed on {pod}: {verify2.stderr.strip()}"
+                )
+        _log(f"  {pod}: PyTorch ready ({verify.stdout.strip() if verify.returncode == 0 else 'reinstalled'})")
+
+    # Copy training script
+    _run(f"{oc} cp {script_path} {namespace}/{pod}:/tmp/ddp_test.py -c slurmd")
+    return pod
+
+
 def provision_workers(cluster_info, plan, pytorch_index="https://download.pytorch.org/whl/cu124"):
     """Install PyTorch and copy ddp_test.py to all workers + controller.
-    Verifies each worker can actually import torch before proceeding."""
+    Workers are provisioned in parallel to minimize wait time."""
     oc = cluster_info["oc"]
     namespace = cluster_info["namespace"]
     controller = cluster_info["controller"]
     workers = cluster_info["workers"]
     script_path = str(Path(__file__).resolve())
 
-    _log(f"Provisioning {len(workers)} worker(s)...")
+    _log(f"Provisioning {len(workers)} worker(s) in parallel...")
 
-    for pod in workers:
-        # Check if already provisioned and working
-        ret = subprocess.run(
-            f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-            f"python3 -c \"import torch; print(torch.__version__)\"",
-            shell=True, capture_output=True, text=True,
-        )
-        if ret.returncode == 0:
-            _log(f"  {pod}: PyTorch verified ({ret.stdout.strip()}), copying script...")
-        else:
-            _log(f"  {pod}: Installing pip + PyTorch (this takes a few minutes)...")
+    # Provision all workers concurrently
+    errors = []
+    with ThreadPoolExecutor(max_workers=len(workers)) as executor:
+        futures = {
+            executor.submit(_provision_single_worker, pod, oc, namespace, script_path, pytorch_index): pod
+            for pod in workers
+        }
+        for future in as_completed(futures):
+            pod = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                errors.append(f"{pod}: {e}")
 
-            # Install pip — retry until it works
-            for attempt in range(3):
-                pip_ret = subprocess.run(
-                    f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-                    f"bash -c 'apt-get update -qq && apt-get install -y -qq python3-pip'",
-                    shell=True, capture_output=True, text=True,
-                )
-                if pip_ret.returncode == 0:
-                    break
-                _log(f"  {pod}: pip install attempt {attempt+1} failed, retrying in 15s...")
-                time.sleep(15)
-            else:
-                raise LaunchError(f"Failed to install pip on {pod}: {pip_ret.stderr.strip()}")
-
-            # Install PyTorch — this is the slow step
-            _log(f"  {pod}: Installing PyTorch (this is the slow part)...")
-            torch_ret = subprocess.run(
-                f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-                f"pip3 install --break-system-packages torch "
-                f"--index-url {pytorch_index}",
-                shell=True, capture_output=True, text=True,
-            )
-            if torch_ret.returncode != 0:
-                _log(f"  {pod}: First torch install failed, retrying...")
-                torch_ret = subprocess.run(
-                    f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-                    f"pip3 install --break-system-packages --force-reinstall torch "
-                    f"--index-url {pytorch_index}",
-                    shell=True, capture_output=True, text=True,
-                )
-                if torch_ret.returncode != 0:
-                    raise LaunchError(
-                        f"PyTorch installation failed on {pod}: {torch_ret.stderr[-500:]}"
-                    )
-
-            # Verify installation succeeded
-            _log(f"  {pod}: Verifying PyTorch import...")
-            verify = subprocess.run(
-                f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-                f"python3 -c \"import torch; print(torch.__version__)\"",
-                shell=True, capture_output=True, text=True,
-            )
-            if verify.returncode != 0:
-                _log(f"  {pod}: WARNING — PyTorch import failed, retrying install...")
-                _run(
-                    f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-                    f"pip3 install --break-system-packages --force-reinstall torch "
-                    f"--index-url {pytorch_index}",
-                    check=False,
-                )
-                # Final check
-                verify2 = subprocess.run(
-                    f"{oc} exec -n {namespace} {pod} -c slurmd -- "
-                    f"python3 -c \"import torch; print(torch.__version__)\"",
-                    shell=True, capture_output=True, text=True,
-                )
-                if verify2.returncode != 0:
-                    raise LaunchError(
-                        f"PyTorch installation failed on {pod}: {verify2.stderr.strip()}"
-                    )
-            _log(f"  {pod}: PyTorch ready ({verify.stdout.strip() if verify.returncode == 0 else 'reinstalled'})")
-
-        # Copy training script
-        _run(f"{oc} cp {script_path} {namespace}/{pod}:/tmp/ddp_test.py -c slurmd")
+    if errors:
+        raise LaunchError(f"Provisioning failed:\n  " + "\n  ".join(errors))
 
     # Final readiness gate: confirm ALL workers can import torch
     _log("Verifying all workers are ready...")
