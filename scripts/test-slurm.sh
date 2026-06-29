@@ -122,7 +122,7 @@ if [ "$QUICK_MODE" = true ]; then
   log_info "3. Submitting test job..."
   JOB_OUTPUT=$(oc exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -- sbatch --output=/tmp/quick-test.out --wrap="echo 'Quick test job' && hostname && date && echo 'Job completed successfully'")
   echo "$JOB_OUTPUT"
-  JOB_ID=$(echo "$JOB_OUTPUT" | awk '{print $4}')
+  JOB_ID=$(echo "$JOB_OUTPUT" | awk '/Submitted batch job/{print $4}')
   log_info "Job ID: $JOB_ID"
   echo ""
   

@@ -684,6 +684,8 @@ def _parse_memory_to_mb(mem_str):
         return int(float(mem_str[:-1]))
     elif mem_str.endswith("Ki"):
         return int(float(mem_str[:-2]) / 1024)
+    elif mem_str.isdigit():
+        return int(mem_str) // (1024 * 1024)
     else:
         raise ValueError(f"Unrecognized Kubernetes memory format: {mem_str!r}")
 

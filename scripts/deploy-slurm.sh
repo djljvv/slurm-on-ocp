@@ -236,7 +236,7 @@ install_slurm_operator() {
     log_info "Skipping operator installation"
     
     # Verify operator pods are running
-    if oc get pods -n "$OPERATOR_NS" -l app.kubernetes.io/name=slurm-operator 2>/dev/null | grep -q Running; then
+    if oc get pods -n "$OPERATOR_NS" -l app.kubernetes.io/name=slurm-operator --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q .; then
       log_info "✓ Slurm Operator pods are running"
       return
     else
@@ -246,7 +246,7 @@ install_slurm_operator() {
   fi
   
   # Check if operator is installed via OperatorHub (in openshift-operators)
-  if oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator 2>/dev/null | grep -q Running; then
+  if oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q .; then
     log_info "Slurm Operator is already installed via OperatorHub (in openshift-operators namespace)"
     log_info "Skipping operator installation"
     return
@@ -301,9 +301,9 @@ deploy_slurm_cluster() {
   log_info "Deploying Slurm cluster..."
   
   # Detect operator (either namespace) — informational only, YAML deploy works with both
-  if oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator 2>/dev/null | grep -q Running; then
+  if oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q .; then
     log_info "Operator detected in openshift-operators (OperatorHub)"
-  elif oc get pods -n "$OPERATOR_NS" -l app.kubernetes.io/name=slurm-operator 2>/dev/null | grep -q Running; then
+  elif oc get pods -n "$OPERATOR_NS" -l app.kubernetes.io/name=slurm-operator --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q .; then
     log_info "Operator detected in $OPERATOR_NS (Helm)"
   else
     log_warn "Operator not detected in openshift-operators or $OPERATOR_NS"
@@ -372,7 +372,7 @@ deploy_cluster_via_yaml() {
   log_info "Waiting for controller pod to be Running..."
   local waited=0
   while [ $waited -lt 120 ]; do
-    if oc get pod slurm-controller-0 -n "$NAMESPACE" 2>/dev/null | grep -q "Running"; then
+    if oc get pod slurm-controller-0 -n "$NAMESPACE" --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q .; then
       log_info "Controller pod is Running"
       break
     fi
@@ -415,13 +415,13 @@ verify_deployment() {
   
   # Check operator (in operator namespace)
   log_info "Checking Slurm Operator (namespace: $OPERATOR_NS)..."
-  if oc get pods -n "$OPERATOR_NS" -l app.kubernetes.io/name=slurm-operator 2>/dev/null | grep -q Running; then
+  if oc get pods -n "$OPERATOR_NS" -l app.kubernetes.io/name=slurm-operator --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q .; then
     log_info "✓ Slurm Operator is running in namespace: $OPERATOR_NS"
     oc get pods -n "$OPERATOR_NS" -l app.kubernetes.io/name=slurm-operator
   else
     log_warn "⚠ Slurm Operator not found in namespace: $OPERATOR_NS"
     log_info "Checking if operator is installed via OperatorHub..."
-    if oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator 2>/dev/null | grep -q Running; then
+    if oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q .; then
       log_info "✓ Slurm Operator is running in namespace: openshift-operators (OperatorHub installation)"
       oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator
     else
@@ -434,20 +434,21 @@ verify_deployment() {
   
   # Check cluster (in target namespace)
   log_info "Checking Slurm Cluster (namespace: $NAMESPACE)..."
-  if oc get pods -n "$NAMESPACE" 2>/dev/null | grep -q controller; then
+  if oc get pods -n "$NAMESPACE" --field-selector=status.phase=Running 2>/dev/null | grep -q controller; then
     log_info "✓ Slurm Controller is running in namespace: $NAMESPACE"
     oc get pods -n "$NAMESPACE" | grep controller || true
   else
-    log_warn "⚠ Slurm Controller not found in namespace: $NAMESPACE"
-    log_info "All pods in namespace $NAMESPACE:"
-    oc get pods -n "$NAMESPACE" 2>/dev/null || log_warn "Namespace $NAMESPACE may not exist yet"
+    log_error "✗ Slurm Controller not found running in namespace: $NAMESPACE"
+    oc get pods -n "$NAMESPACE" 2>/dev/null || log_error "Namespace $NAMESPACE may not exist"
+    return 1
   fi
   
-  if oc get pods -n "$NAMESPACE" 2>/dev/null | grep -qE "slurm-worker-slinky|slurmd"; then
+  if oc get pods -n "$NAMESPACE" -l app.kubernetes.io/name=slurmd --field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q .; then
     log_info "✓ Slurm compute nodes are running in namespace: $NAMESPACE"
-    oc get pods -n "$NAMESPACE" -l app.kubernetes.io/name=slurmd 2>/dev/null || oc get pods -n "$NAMESPACE" | grep -E "slurm-worker-slinky|worker" || true
+    oc get pods -n "$NAMESPACE" -l app.kubernetes.io/name=slurmd 2>/dev/null || true
   else
-    log_warn "⚠ No compute pods found in namespace: $NAMESPACE (may still be starting)"
+    log_error "✗ No running compute pods found in namespace: $NAMESPACE"
+    return 1
   fi
   
   echo ""

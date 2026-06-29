@@ -48,22 +48,31 @@ scale_nodeset() {
 
 get_pending_info() {
   kubectl exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -- \
-    sh -c 'squeue -h -t PENDING -o "%i %D" 2>/dev/null || echo ""'
+    squeue -h -t PENDING -o "%i %D"
 }
 
 is_provisioned() {
-  # Live check only — no file cache (survives pod restarts)
   kubectl exec -n "$NAMESPACE" "$1" -c slurmd -- \
-    python3 -c "import torch" >/dev/null 2>&1
+    test -f /tmp/.provisioning_done >/dev/null 2>&1
+}
+
+is_provisioning() {
+  kubectl exec -n "$NAMESPACE" "$1" -c slurmd -- \
+    test -f /tmp/.provisioning_in_progress >/dev/null 2>&1
 }
 
 provision_worker() {
   local pod="$1"
   log "PROVISION: installing dependencies on ${pod}..."
 
+  # Write sentinel so concurrent polls skip this pod
+  kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- \
+    touch /tmp/.provisioning_in_progress >/dev/null 2>&1 || true
+
   if ! kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- \
     bash -c "apt-get update -qq && apt-get install -y -qq python3-pip" >/dev/null 2>&1; then
     log "PROVISION: WARNING: pip install failed on ${pod}"
+    kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- rm -f /tmp/.provisioning_in_progress >/dev/null 2>&1 || true
     return 1
   fi
 
@@ -71,6 +80,7 @@ provision_worker() {
   if ! kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- \
     pip3 install --break-system-packages torch --index-url "$PYTORCH_INDEX" >/dev/null 2>&1; then
     log "PROVISION: WARNING: PyTorch install failed on ${pod}"
+    kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- rm -f /tmp/.provisioning_in_progress >/dev/null 2>&1 || true
     return 1
   fi
 
@@ -78,11 +88,15 @@ provision_worker() {
     if [ -f "/scripts/${script}" ]; then
       kubectl cp "/scripts/${script}" "${NAMESPACE}/${pod}:/tmp/${script}" -c slurmd || {
         log "PROVISION: WARNING: failed to copy ${script} to ${pod}"
+        kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- rm -f /tmp/.provisioning_in_progress >/dev/null 2>&1 || true
         return 1
       }
     fi
   done
 
+  # Mark done: swap in-progress for completed sentinel
+  kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- \
+    bash -c "rm -f /tmp/.provisioning_in_progress && touch /tmp/.provisioning_done" >/dev/null 2>&1
   log "PROVISION: ${pod} ready"
   return 0
 }
@@ -103,7 +117,7 @@ provision_new_workers() {
       continue
     fi
 
-    if ! is_provisioned "$pod"; then
+    if ! is_provisioned "$pod" && ! is_provisioning "$pod"; then
       local ready_count
       ready_count=$(kubectl get pod "$pod" -n "$NAMESPACE" \
         -o jsonpath='{.status.containerStatuses[?(@.ready==true)].name} {.status.initContainerStatuses[?(@.ready==true)].name}' 2>/dev/null \
@@ -161,7 +175,13 @@ while true; do
   fi
   PREV_REPLICAS="$CURRENT"
 
-  PENDING_OUTPUT=$(get_pending_info 2>/dev/null || echo "")
+  # Query squeue — if kubectl exec fails, skip this iteration rather than
+  # assuming 0 jobs (which could trigger premature scale-down).
+  if ! PENDING_OUTPUT=$(get_pending_info 2>/dev/null); then
+    log "WARNING: failed to query pending jobs (controller unreachable?), skipping cycle"
+    sleep "$POLL_INTERVAL"
+    continue
+  fi
 
   PENDING_COUNT=0
   RUNNING_COUNT=0
@@ -170,8 +190,12 @@ while true; do
   fi
 
   # Also check for running jobs — don't scale down while jobs are active
-  RUNNING_OUTPUT=$(kubectl exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -- \
-    sh -c 'squeue -h -t RUNNING -o "%i" 2>/dev/null || echo ""' 2>/dev/null || echo "")
+  if ! RUNNING_OUTPUT=$(kubectl exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -- \
+    squeue -h -t RUNNING -o "%i" 2>/dev/null); then
+    log "WARNING: failed to query running jobs (controller unreachable?), skipping cycle"
+    sleep "$POLL_INTERVAL"
+    continue
+  fi
   if [ -n "$RUNNING_OUTPUT" ]; then
     RUNNING_COUNT=$(printf '%s' "$RUNNING_OUTPUT" | grep -c '^' 2>/dev/null || echo 0)
   fi
