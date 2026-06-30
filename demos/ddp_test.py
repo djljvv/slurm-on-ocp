@@ -884,7 +884,8 @@ def _provision_single_worker(pod, oc, namespace, script_path, pytorch_index):
                 raise LaunchError(
                     f"PyTorch installation failed on {pod}: {verify2.stderr.strip()}"
                 )
-        _log(f"  {pod}: PyTorch ready ({verify.stdout.strip() if verify.returncode == 0 else 'reinstalled'})")
+            verify = verify2
+        _log(f"  {pod}: PyTorch ready ({verify.stdout.strip()})")
 
     # Copy training script
     _run([oc, "cp", script_path, f"{namespace}/{pod}:/tmp/ddp_test.py", "-c", "slurmd"])
@@ -898,6 +899,9 @@ def provision_workers(cluster_info, plan, pytorch_index="https://download.pytorc
     namespace = cluster_info["namespace"]
     controller = cluster_info["controller"]
     workers = cluster_info["workers"]
+    if workers is None or len(workers) == 0:
+        _log("No workers found, skipping provisioning")
+        return
     script_path = str(Path(__file__).resolve())
 
     _log(f"Provisioning {len(workers)} worker(s) in parallel...")

@@ -80,6 +80,10 @@ if oc get namespace "$NAMESPACE" &>/dev/null; then
   run_ignore oc delete -f "$REPO_ROOT/configs/slurm-autoscaler.yaml" --ignore-not-found --timeout=30s
   run_ignore oc delete configmap slurm-autoscaler-script -n "$NAMESPACE" --ignore-not-found --timeout=30s
 
+  # Discover controller SA before deleting pods (needed for SCC cleanup later)
+  _CTRL_SA=$(oc get pod slurm-controller-0 -n "$NAMESPACE" \
+    -o jsonpath='{.spec.serviceAccountName}' 2>/dev/null || echo "")
+
   log_info "Deleting Controller and NodeSet (custom resources)..."
   run_ignore oc delete controller --all -n "$NAMESPACE" --ignore-not-found --timeout=60s
   run_ignore oc delete nodeset --all -n "$NAMESPACE" --ignore-not-found --timeout=60s
@@ -97,8 +101,12 @@ if oc get namespace "$NAMESPACE" &>/dev/null; then
   run_ignore oc delete secret --all -n "$NAMESPACE" --ignore-not-found --timeout=30s
   run_ignore oc delete pvc --all -n "$NAMESPACE" --ignore-not-found --timeout=60s
 
-  log_info "Removing SCC from default service account..."
+  log_info "Removing anyuid SCC grants..."
+  run_ignore oc adm policy remove-scc-from-user anyuid -z slurm-workload -n "$NAMESPACE"
   run_ignore oc adm policy remove-scc-from-user anyuid -z default -n "$NAMESPACE"
+  if [ -n "${_CTRL_SA:-}" ] && [ "$_CTRL_SA" != "slurm-workload" ] && [ "$_CTRL_SA" != "default" ]; then
+    run_ignore oc adm policy remove-scc-from-user anyuid -z "$_CTRL_SA" -n "$NAMESPACE"
+  fi
 
   log_info "Deleting namespace $NAMESPACE..."
   if oc delete namespace "$NAMESPACE" --ignore-not-found --timeout=120s 2>/dev/null; then

@@ -333,12 +333,16 @@ deploy_cluster_via_yaml() {
   
   # Create namespace if it doesn't exist
   oc create namespace "$NAMESPACE" 2>/dev/null || true
+
+  # Create service account if it doesn't exist
+  oc create serviceaccount slurm-workload -n "$NAMESPACE" 2>/dev/null || true
   
-  # Grant anyuid SCC (slurmd needs to run as specific UIDs)
-  log_info "Granting anyuid SCC to default service account..."
-  oc adm policy add-scc-to-user anyuid -z default -n "$NAMESPACE" 2>/dev/null || {
-    log_warn "SCC may already be granted, continuing..."
-  }
+  # Grant anyuid SCC to slurm-workload (for NodeSet workers) and default
+  # (bootstrap for controller — the operator may use default or its own SA;
+  #  we narrow this after discovering the actual controller SA below)
+  log_info "Granting anyuid SCC to slurm-workload and default (bootstrap)..."
+  oc adm policy add-scc-to-user anyuid -z slurm-workload -n "$NAMESPACE" 2>/dev/null || true
+  oc adm policy add-scc-to-user anyuid -z default -n "$NAMESPACE" 2>/dev/null || true
   
   # Create secrets if they don't exist (operator default names/keys)
   if ! oc get secret slurm-auth-jwths256 -n "$NAMESPACE" &>/dev/null; then
@@ -381,6 +385,25 @@ deploy_cluster_via_yaml() {
   done
   if [ $waited -ge 120 ]; then
     log_warn "Controller pod not Running after 120s (may still be pulling image)"
+  fi
+
+  # Discover which SA the operator assigned to the controller pod.
+  # The pod may exist even if it failed admission (SCC rejection), so we can
+  # still read spec.serviceAccountName from a non-Running pod.
+  CTRL_SA=$(oc get pod slurm-controller-0 -n "$NAMESPACE" \
+    -o jsonpath='{.spec.serviceAccountName}' 2>/dev/null || echo "")
+
+  if [ -z "$CTRL_SA" ]; then
+    log_warn "Could not determine controller SA — keeping anyuid on 'default'"
+  elif [ "$CTRL_SA" = "default" ]; then
+    log_info "Controller uses 'default' SA — anyuid already granted (bootstrap)"
+  elif [ "$CTRL_SA" = "slurm-workload" ]; then
+    log_info "Controller uses slurm-workload SA — anyuid already granted, revoking from 'default'"
+    oc adm policy remove-scc-from-user anyuid -z default -n "$NAMESPACE" 2>/dev/null || true
+  else
+    log_info "Controller uses SA '$CTRL_SA' — granting anyuid, revoking from 'default'"
+    oc adm policy add-scc-to-user anyuid -z "$CTRL_SA" -n "$NAMESPACE" 2>/dev/null || true
+    oc adm policy remove-scc-from-user anyuid -z default -n "$NAMESPACE" 2>/dev/null || true
   fi
 
   log_info "Waiting for worker pods to be Running..."

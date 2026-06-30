@@ -90,6 +90,14 @@ oc get pods -n slurm
 oc get controllers,nodesets -n slurm
 ```
 
+### Step 6: Deploy autoscaler (optional, required for auto scale-down)
+
+```bash
+./scripts/deploy-autoscale.sh
+```
+
+Without this, `ddp_test.py --launch` can scale the cluster up, but idle nodes will never scale back down.
+
 ## Testing
 
 ```bash

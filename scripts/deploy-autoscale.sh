@@ -61,7 +61,12 @@ oc create configmap slurm-autoscaler-script -n "$NAMESPACE" \
 log "Applying autoscaler RBAC and Deployment..."
 oc apply -f "${REPO_ROOT}/configs/slurm-autoscaler.yaml"
 
-log "Granting privileged SCC to autoscaler service account..."
+# The autoscaler pod itself runs as non-root with restricted capabilities.
+# However, OpenShift requires the exec caller's SA to hold an SCC that can
+# validate the target pod's security context. Since slurmd containers run
+# with privileged capabilities (SYS_ADMIN, NET_ADMIN, etc.), the autoscaler
+# SA needs the privileged SCC to be allowed to kubectl exec into them.
+log "Granting privileged SCC to autoscaler SA (required for exec into slurmd pods)..."
 oc adm policy add-scc-to-user privileged -z slurm-autoscaler -n "$NAMESPACE" 2>/dev/null || true
 
 log "Waiting for autoscaler pod..."
