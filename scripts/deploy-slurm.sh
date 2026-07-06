@@ -47,6 +47,15 @@ SKIP_OPERATOR=false
 SKIP_CLUSTER=false
 DRY_RUN=false
 
+# Pinned to the last chart release on Slurm app version 25.11, matching the
+# slurmctld/slurmd image tags hardcoded in configs/slurm-cluster.yaml. Chart
+# 1.2.0 bumped the operator to app version 26.05, whose NodeSet reconciler
+# builds worker pods requesting `privileged: true` plus BPF/NET_ADMIN/SYS_ADMIN
+# capabilities — no OpenShift SCC (including anyuid) allows that, so pods are
+# rejected at admission and no workers ever get created. Pinning avoids
+# silently picking up a future breaking chart release the same way.
+SLURM_OPERATOR_CHART_VERSION="1.1.1"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -198,12 +207,14 @@ install_slurm_operator_crds() {
     local err
     if ! err=$(helm upgrade --install slurm-operator-crds \
       oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
+      --version "$SLURM_OPERATOR_CHART_VERSION" \
       --namespace "$OPERATOR_NS" \
       --create-namespace \
       --server-side=false 2>&1); then
       log_warn "--server-side=false failed: $err — retrying without flag"
       helm upgrade --install slurm-operator-crds \
         oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
+        --version "$SLURM_OPERATOR_CHART_VERSION" \
         --namespace "$OPERATOR_NS" \
         --create-namespace || {
           log_error "Failed to install CRDs via Helm"
@@ -259,6 +270,7 @@ install_slurm_operator() {
     local err
     if ! err=$(helm upgrade --install slurm-operator \
       oci://ghcr.io/slinkyproject/charts/slurm-operator \
+      --version "$SLURM_OPERATOR_CHART_VERSION" \
       --namespace "$OPERATOR_NS" \
       --create-namespace \
       --server-side=false \
@@ -266,6 +278,7 @@ install_slurm_operator() {
       log_warn "--server-side=false failed: $err — retrying without flag"
       helm upgrade --install slurm-operator \
         oci://ghcr.io/slinkyproject/charts/slurm-operator \
+        --version "$SLURM_OPERATOR_CHART_VERSION" \
         --namespace "$OPERATOR_NS" \
         --create-namespace \
         --wait --timeout 5m || {
@@ -343,6 +356,18 @@ deploy_cluster_via_yaml() {
   log_info "Granting anyuid SCC to slurm-workload and default (bootstrap)..."
   oc adm policy add-scc-to-user anyuid -z slurm-workload -n "$NAMESPACE" 2>/dev/null || true
   oc adm policy add-scc-to-user anyuid -z default -n "$NAMESPACE" 2>/dev/null || true
+
+  # Also grant privileged SCC to slurm-workload. This is a genuine upstream
+  # requirement, not an OpenShift-specific workaround: Slurm's cgroup/v2 plugin
+  # manages per-job GPU/device access via an eBPF program that slurmstepd loads
+  # into the kernel at runtime (see https://slurm.schedmd.com/cgroup_v2.html),
+  # which needs the BPF/NET_ADMIN/SYS_ADMIN capabilities and cgroup write access
+  # that only the privileged SCC provides — anyuid alone explicitly forbids
+  # both. Without this, the operator's NodeSet reconciler fails admission on
+  # every worker pod ("unable to validate against any security context
+  # constraint") and no worker pods are ever created.
+  log_info "Granting privileged SCC to slurm-workload (required for Slurm's eBPF-based cgroup/v2 device control)..."
+  oc adm policy add-scc-to-user privileged -z slurm-workload -n "$NAMESPACE" 2>/dev/null || true
   
   # Create/update the ConfigMap holding worker training script(s). The NodeSet
   # mounts this directly onto every worker pod (see configs/slurm-cluster.yaml),

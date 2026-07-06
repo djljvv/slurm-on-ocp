@@ -53,15 +53,19 @@ helm install cert-manager jetstack/cert-manager \
 ### Step 2: Install Slurm Operator CRDs and Operator
 
 ```bash
-# CRDs
+# CRDs (--version pinned: chart 1.2.0+ bumps to Slurm app version 26.05, whose
+# NodeSet reconciler requests privileged+BPF/NET_ADMIN/SYS_ADMIN on worker pods,
+# which no OpenShift SCC allows — pods get silently rejected and never appear)
 helm install slurm-operator-crds \
   oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
+  --version 1.1.1 \
   --namespace slinky --create-namespace --server-side=false
 sleep 10
 
-# Operator
+# Operator (--version pinned to match the CRDs chart above)
 helm install slurm-operator \
   oci://ghcr.io/slinkyproject/charts/slurm-operator \
+  --version 1.1.1 \
   --namespace slinky --create-namespace --server-side=false --wait --timeout 5m
 
 oc get pods -n slinky

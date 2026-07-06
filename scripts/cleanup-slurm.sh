@@ -101,8 +101,9 @@ if oc get namespace "$NAMESPACE" &>/dev/null; then
   run_ignore oc delete secret --all -n "$NAMESPACE" --ignore-not-found --timeout=30s
   run_ignore oc delete pvc --all -n "$NAMESPACE" --ignore-not-found --timeout=60s
 
-  log_info "Removing anyuid SCC grants..."
+  log_info "Removing anyuid/privileged SCC grants..."
   run_ignore oc adm policy remove-scc-from-user anyuid -z slurm-workload -n "$NAMESPACE"
+  run_ignore oc adm policy remove-scc-from-user privileged -z slurm-workload -n "$NAMESPACE"
   run_ignore oc adm policy remove-scc-from-user anyuid -z default -n "$NAMESPACE"
   if [ -n "${_CTRL_SA:-}" ] && [ "$_CTRL_SA" != "slurm-workload" ] && [ "$_CTRL_SA" != "default" ]; then
     run_ignore oc adm policy remove-scc-from-user anyuid -z "$_CTRL_SA" -n "$NAMESPACE"
@@ -125,13 +126,17 @@ if [ "$REMOVE_OPERATOR" = true ]; then
   log_info "Removing Slurm operator (OperatorHub and/or Helm)..."
 
   # 2a. OperatorHub (openshift-operators)
+  # Note: `grep` exits 1 when it finds no matches (e.g. operator installed via Helm,
+  # not OperatorHub), which under `set -o pipefail` would otherwise abort the whole
+  # script here due to `set -e`. The trailing `|| true` on each pipeline makes "no
+  # matching subscription/CSV" a non-fatal, expected outcome instead of a hard stop.
   log_info "Removing OperatorHub subscription and CSV..."
   oc get subscription -n openshift-operators -o name 2>/dev/null | grep -i slurm | while read -r sub; do
     oc delete -n openshift-operators "$sub" --ignore-not-found --timeout=30s 2>/dev/null || true
-  done
+  done || true
   oc get csv -n openshift-operators -o name 2>/dev/null | grep -i slurm | while read -r csv; do
     oc delete -n openshift-operators "$csv" --ignore-not-found --timeout=60s 2>/dev/null || true
-  done
+  done || true
   run_ignore oc delete pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator --ignore-not-found --timeout=30s
 
   # 2b. Helm (slinky namespace)

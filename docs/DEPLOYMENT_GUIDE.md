@@ -99,8 +99,15 @@ if oc get crd controllers.slinky.slurm.net &>/dev/null; then
   echo "CRDs already installed, skipping..."
 else
   # Install Slurm Operator CRDs
+  # NOTE: --version is pinned deliberately. Chart 1.2.0+ bumps the operator to
+  # Slurm app version 26.05, whose NodeSet reconciler requests `privileged: true`
+  # plus BPF/NET_ADMIN/SYS_ADMIN capabilities on worker pods — no OpenShift SCC
+  # (including anyuid) allows that, so worker pods get silently rejected at
+  # admission and never appear. 1.1.1 is the last chart release on app version
+  # 25.11, matching the image tags already pinned in configs/slurm-cluster.yaml.
   helm install slurm-operator-crds \
     oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
+    --version 1.1.1 \
     --namespace slinky \
     --create-namespace \
     --server-side=false
@@ -130,9 +137,10 @@ if oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator -o jsonpath='{
    oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running; then
   echo "Slurm Operator already installed and running, skipping..."
 else
-  # Install Slurm Operator
+  # Install Slurm Operator (--version pinned to match the CRDs chart in Step 2)
   helm install slurm-operator \
     oci://ghcr.io/slinkyproject/charts/slurm-operator \
+    --version 1.1.1 \
     --namespace slinky \
     --create-namespace \
     --server-side=false \
@@ -169,7 +177,7 @@ If operator is installed via Software Catalog/OperatorHub, use Option B (Direct 
 
 This will:
 - Detect existing CRDs and operator (skip installation)
-- Create the `slurm-workload` service account and grant it the `anyuid` SCC (bootstraps `default` too, then narrows to whichever SA the operator actually assigns to the controller)
+- Create the `slurm-workload` service account and grant it the `anyuid` SCC (bootstraps `default` too, then narrows to whichever SA the operator actually assigns to the controller) **and** the `privileged` SCC (required — see note below)
 - Create the `slurm-worker-scripts` ConfigMap (mounts `demos/ddp_test.py` onto every worker pod) and `slurm-gres-conf` ConfigMap (static GPU device mapping so `slurmd` can report its GPU at dynamic registration time)
 - Deploy cluster using direct YAML (works with OperatorHub) — each worker runs an init container that installs PyTorch **before** `slurmd` starts, so a node can never be scheduled onto until it's actually ready (see Step 5 troubleshooting for what this looks like)
 - Deploy the autoscaler (scales workers up/down automatically based on Slurm queue demand — pending/running jobs that need more nodes trigger scale-up; idle workers scale back down after 5 minutes)
@@ -179,12 +187,15 @@ This will:
 
 **Note:** `configs/slurm-cluster.yaml` runs worker pods under the `slurm-workload` service account and mounts two ConfigMaps (`slurm-worker-scripts`, `slurm-gres-conf`). If you skip creating them, worker pods will fail to start (`serviceaccount "slurm-workload" not found` or `configmap "..." not found`). `./scripts/deploy-slurm.sh` (Option A) creates all of this for you automatically — the steps below just show what it does manually.
 
+**Note on the `privileged` SCC:** this is a genuine upstream requirement, not an OpenShift-specific workaround. Slurm's cgroup/v2 plugin manages per-job GPU/device access via an eBPF program that `slurmstepd` loads into the kernel at runtime (see [Slurm's cgroup v2 docs](https://slurm.schedmd.com/cgroup_v2.html)), which needs the `BPF`/`NET_ADMIN`/`SYS_ADMIN` capabilities and cgroup write access that only the `privileged` SCC provides — `anyuid` alone explicitly forbids both. Without it, worker pods are rejected at admission (`unable to validate against any security context constraint`) and never get created, even though the `Controller`/`NodeSet` objects and `slurmctld` come up fine.
+
 ```bash
 # 1. Create namespace, service account, and configure security
 oc create namespace slurm 2>/dev/null || true
 oc create serviceaccount slurm-workload -n slurm 2>/dev/null || true
 oc adm policy add-scc-to-user anyuid -z slurm-workload -n slurm
 oc adm policy add-scc-to-user anyuid -z default -n slurm
+oc adm policy add-scc-to-user privileged -z slurm-workload -n slurm
 
 # 2. Create secrets (operator default names/keys so UI template works without editing refs)
 JWT_KEY=$(openssl rand -base64 32)
@@ -269,6 +280,7 @@ slurm-worker-slinky-1         2/2     Running   0          2m
 
 **Troubleshooting Step 5:**
 - **Pods stuck in `Pending`** — Check if the `anyuid` SCC was applied: `oc get pods -n slurm -o wide` and `oc describe pod <pod-name> -n slurm | grep -A5 Events`. If you see SCC-related errors, apply it: `oc adm policy add-scc-to-user anyuid -z default -n slurm`. Worker pods run as the `slurm-workload` service account (see `spec.template.spec.serviceAccountName` in `configs/slurm-cluster.yaml`), so also grant it there: `oc adm policy add-scc-to-user anyuid -z slurm-workload -n slurm`.
+- **No worker pods ever appear at all (`oc get pods -n slurm` shows only `slurm-controller-0`, `Controller`/`NodeSet` both exist and look healthy)** — This means the operator is failing to even create the Pod objects, which won't show up as `Pending` because they never got past admission. Confirm by checking the operator's own logs: `oc logs -n slinky -l app.kubernetes.io/name=slurm-operator --tail=200 | grep -i nodeset`. If you see `unable to validate against any security context constraint` mentioning `privileged` or `capabilities.add` (`BPF`/`NET_ADMIN`/`SYS_ADMIN`), `anyuid` isn't enough — Slurm's cgroup/v2 plugin needs the `privileged` SCC too (it loads an eBPF program for per-job device/GPU cgroup control; see [Slurm's cgroup v2 docs](https://slurm.schedmd.com/cgroup_v2.html)). Fix with: `oc adm policy add-scc-to-user privileged -z slurm-workload -n slurm`, then nudge the NodeSet to reconcile (see next bullet). `./scripts/deploy-slurm.sh` grants this automatically as of this fix.
 - **Worker pods not appearing after SCC fix** — The operator may need a nudge to reconcile. Force it by annotating the NodeSet:
   ```bash
   oc annotate nodeset slurm-worker-slinky -n slurm reconcile=$(date +%s) --overwrite
@@ -402,8 +414,15 @@ if oc get crd controllers.slinky.slurm.net &>/dev/null; then
   echo "CRDs already installed, skipping..."
 else
   # Install Slurm Operator CRDs
+  # NOTE: --version is pinned deliberately. Chart 1.2.0+ bumps the operator to
+  # Slurm app version 26.05, whose NodeSet reconciler requests `privileged: true`
+  # plus BPF/NET_ADMIN/SYS_ADMIN capabilities on worker pods — no OpenShift SCC
+  # (including anyuid) allows that, so worker pods get silently rejected at
+  # admission and never appear. 1.1.1 is the last chart release on app version
+  # 25.11, matching the image tags already pinned in configs/slurm-cluster.yaml.
   helm install slurm-operator-crds \
     oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
+    --version 1.1.1 \
     --namespace slinky \
     --create-namespace \
     --server-side=false
@@ -420,9 +439,10 @@ if oc get pods -n slinky -l app.kubernetes.io/name=slurm-operator -o jsonpath='{
    oc get pods -n openshift-operators -l app.kubernetes.io/name=slurm-operator -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running; then
   echo "Slurm Operator already installed and running, skipping..."
 else
-  # Install Slurm Operator
+  # Install Slurm Operator (--version pinned to match the CRDs chart above)
   helm install slurm-operator \
     oci://ghcr.io/slinkyproject/charts/slurm-operator \
+    --version 1.1.1 \
     --namespace slinky \
     --create-namespace \
     --server-side=false \
@@ -450,6 +470,13 @@ oc create namespace slurm
 
 # Grant anyuid SCC (allows pods to run with the UID required by Slurm - UID 401)
 oc adm policy add-scc-to-user anyuid -z default -n slurm
+
+# Grant privileged SCC (required — Slurm's cgroup/v2 plugin loads an eBPF
+# program into the kernel for per-job device/cgroup control, which needs
+# BPF/NET_ADMIN/SYS_ADMIN capabilities that anyuid alone does not grant;
+# see https://slurm.schedmd.com/cgroup_v2.html). Without this, worker pods
+# are rejected at admission and never get created.
+oc adm policy add-scc-to-user privileged -z default -n slurm
 ```
 
 > **Why anyuid?** Slurm daemons need to run as specific UIDs (e.g., UID 401 for the `slurm` user). OpenShift's default SCC restricts pods to a narrow UID range. The `anyuid` SCC grants the exception.
@@ -459,9 +486,10 @@ oc adm policy add-scc-to-user anyuid -z default -n slurm
 - Click "Create Project"
 - Name: `slurm`
 - Click "Create"
-- **Then via terminal**, grant the SCC:
+- **Then via terminal**, grant the SCCs:
   ```bash
   oc adm policy add-scc-to-user anyuid -z default -n slurm
+  oc adm policy add-scc-to-user privileged -z default -n slurm
   ```
 
 #### Step 3.2: Create Required Secrets (SECOND STEP)
@@ -866,6 +894,11 @@ oc create namespace slurm
 
 # Grant anyuid SCC to allow Slurm to run with required UID (401)
 oc adm policy add-scc-to-user anyuid -z default -n slurm
+
+# Grant privileged SCC (required for Slurm's eBPF-based cgroup/v2 device
+# control; see the "Why anyuid?" note in Step 3.1 above). Without this,
+# worker pods are rejected at admission and never get created.
+oc adm policy add-scc-to-user privileged -z default -n slurm
 
 # Step 2: Create required secrets (operator default names/keys)
 JWT_KEY=$(openssl rand -base64 32)
@@ -1333,6 +1366,7 @@ oc delete statefulset,deployment,pods,svc,pvc --all -n slurm
 oc delete configmap --all -n slurm
 oc delete secret slurm-auth-jwths256 slurm-auth-slurm -n slurm
 oc adm policy remove-scc-from-user anyuid -z slurm-workload -n slurm
+oc adm policy remove-scc-from-user privileged -z slurm-workload -n slurm
 oc adm policy remove-scc-from-user anyuid -z default -n slurm
 oc delete namespace slurm
 ```
