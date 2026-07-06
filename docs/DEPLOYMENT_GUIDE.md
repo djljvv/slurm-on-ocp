@@ -289,7 +289,45 @@ slurm-worker-slinky-1         2/2     Running   0          2m
 - **Worker pods sitting in `Init:0/1` for 1-2 minutes** — This is expected, not a failure. Every worker pod runs a `provision-pytorch` init container that installs PyTorch via `pip3` into a per-pod `emptyDir` **before** `slurmd` starts — the node intentionally won't register with (and can't be scheduled onto by) the Slurm controller until this finishes. This runs fresh on every new pod (first deploy, or any time the autoscaler scales up new replicas) — it's not cached across pods. Watch progress with: `oc logs <worker-pod> -n slurm -c provision-pytorch -f`. Once it prints `PyTorch install complete`, the pod moves on to starting `slurmd`.
 - **`configmap "slurm-worker-scripts" not found` or `configmap "slurm-gres-conf" not found`** — These ConfigMaps are required by `configs/slurm-cluster.yaml` but aren't created by `oc apply` itself. Run `./scripts/deploy-slurm.sh` (which creates them automatically), or create them manually as shown in Step 4, Option B.
 
-### Step 6: Test Slurm Cluster
+### Step 6: Deploy the Autoscaler (Required for Auto Scale-Down)
+
+The Controller and NodeSet you just deployed run Slurm itself, but nothing yet watches the job queue to scale the `NodeSet` up or down automatically. `./scripts/deploy-slurm.sh` (Option A in Step 4) deploys this for you as its last step — but if you followed Option B or C above (or are walking through everything by hand), it's **easy to miss entirely**, since it's a separate piece from the Controller/NodeSet you just verified. Symptom if you skip this: workers and jobs run fine, but nothing ever scales up under load or back down when idle.
+
+**Recommended (via script):**
+```bash
+./scripts/deploy-autoscale.sh
+```
+
+**Manual (what the script above does under the hood):**
+```bash
+# 1. Bake the autoscaler loop script into a ConfigMap
+oc create configmap slurm-autoscaler-script -n slurm \
+  --from-file=autoscaler.sh=scripts/autoscaler-loop.sh \
+  --dry-run=client -o yaml | oc apply -f -
+
+# 2. Apply the autoscaler's Deployment + RBAC (ServiceAccount, Role, RoleBinding)
+oc apply -f configs/slurm-autoscaler.yaml
+
+# 3. Grant the privileged SCC to the autoscaler's ServiceAccount. This is
+#    unrelated to the privileged SCC granted to slurm-workload above — the
+#    autoscaler pod itself runs fully unprivileged (runAsNonRoot, all
+#    capabilities dropped); it needs this SCC only because `oc exec`/`kubectl
+#    exec` into slurmctld (to run squeue) requires the CALLER's SA to hold an
+#    SCC that can validate the TARGET container's security context, and
+#    slurmctld runs with elevated capabilities of its own.
+oc adm policy add-scc-to-user privileged -z slurm-autoscaler -n slurm
+
+# Verify it's running
+oc get pods -n slurm -l app.kubernetes.io/name=slurm-autoscaler
+```
+
+**Verify it's actually working:**
+```bash
+oc logs -n slurm -l app.kubernetes.io/name=slurm-autoscaler -f --tail=15
+```
+You should see it logging `IDLE`/`BUSY`/`SCALING` messages every ~30 seconds. If the log shows repeated `WARNING: failed to query pending jobs` instead, re-check step 3 above — the SCC grant is almost always the missing piece.
+
+### Step 7: Test Slurm Cluster
 
 ```bash
 # Get controller pod name
@@ -316,7 +354,7 @@ oc exec -n slurm slurm-worker-slinky-0 -c slurmd -- cat /tmp/test.out 2>/dev/nul
 oc exec -n slurm slurm-worker-slinky-1 -c slurmd -- cat /tmp/test.out
 ```
 
-**Troubleshooting Step 6:**
+**Troubleshooting Step 7:**
 - **"container not found (slurmctld)"** — The controller pod may still be in Init (0/1 or Init:0/2). Wait until the pod is **Running** and **1/1** (or 3/3). Check with: `oc get pods -n slurm -l app.kubernetes.io/name=slurmctld`.
 - **"container not found (slurmd)"** — The slurmd container may not be running (e.g. pod still initializing or slurmd crashing). Check: (1) Pod status: `oc get pods -n slurm -l app.kubernetes.io/name=slurmd` — ensure **Running** and **Ready**. (2) List container names: `oc get pod <slurmd-pod> -n slurm -o jsonpath='{.spec.containers[*].name}'` — use that name with `-c`. (3) If the controller is in CrashLoopBackOff, fix the controller first; worker pods often wait or fail until the controller is Ready.
 - **"Unable to contact slurm controller"** or **"Insane message length"** (controller logs: `on_data returned rc: Insane message length`) — Usually a **version or protocol mismatch** between slurmctld and the connecting slurmd, or **auth key mismatch** (slurm.key). Fix: (1) **Match images**: set `spec.slurmctld.image` and `spec.slurmd.image` to the same tag (e.g. `ghcr.io/slinkyproject/slurmctld:25.11-ubuntu24.04` and `ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04`) in the Controller and NodeSet CRs. (2) **Verify what's running**: `oc get controller slurm -n slurm -o jsonpath='{.spec.slurmctld.image}'` and `oc get nodeset slurm-worker-slinky -n slurm -o jsonpath='{.spec.slurmd.image}'`; if the NodeSet has no image, the operator default may differ — add the image to the NodeSet and re-apply. (3) **Secrets**: Controller and workers must use the same `slurm.key` (from `slurm-auth-slurm`); the operator copies from the Controller's `slurmKeyRef` to workers — do not recreate the secret without redeploying. (4) **Clean restart**: delete worker pods so they stop connecting, let the controller become Ready, then workers will be recreated and reconnect: `oc delete pod -n slurm -l app.kubernetes.io/name=slurmd`; wait for controller to show Ready, then check `oc get pods -n slurm`.
@@ -884,6 +922,26 @@ oc get pods -n slurm -w
    
    **Important:** If you're running commands from your local terminal (not inside the pod), you MUST use `oc exec` with the `-c slurmctld` flag. Slurm commands are NOT installed on your local machine.
 
+### Step 6: Deploy the Autoscaler (Required for Auto Scale-Down)
+
+Everything above gets Slurm itself running, but nothing yet watches the job queue to scale the `NodeSet` up or down automatically — that's a separate piece, easy to miss when following this UI-driven method since there's no operator screen for it. See Method 1's [Step 6](#step-6-deploy-the-autoscaler-required-for-auto-scale-down) for the full explanation of what each command does and why the SCC grant is needed; the commands themselves are identical regardless of which method you used to get here:
+
+```bash
+# Recommended:
+./scripts/deploy-autoscale.sh
+
+# Or manually:
+oc create configmap slurm-autoscaler-script -n slurm \
+  --from-file=autoscaler.sh=scripts/autoscaler-loop.sh \
+  --dry-run=client -o yaml | oc apply -f -
+oc apply -f configs/slurm-autoscaler.yaml
+oc adm policy add-scc-to-user privileged -z slurm-autoscaler -n slurm
+
+# Verify:
+oc get pods -n slurm -l app.kubernetes.io/name=slurm-autoscaler
+oc logs -n slurm -l app.kubernetes.io/name=slurm-autoscaler -f --tail=15
+```
+
 #### Complete Terminal Method (All Steps in Order)
 
 If you prefer to do everything via terminal, here's the complete sequence:
@@ -970,6 +1028,14 @@ EOF
 oc get controllers -n slurm
 oc get nodesets -n slurm
 oc get pods -n slurm
+
+# Step 7: Deploy the autoscaler (easy to forget — see Step 6 above for why
+# each command below is needed)
+oc create configmap slurm-autoscaler-script -n slurm \
+  --from-file=autoscaler.sh=scripts/autoscaler-loop.sh \
+  --dry-run=client -o yaml | oc apply -f -
+oc apply -f configs/slurm-autoscaler.yaml
+oc adm policy add-scc-to-user privileged -z slurm-autoscaler -n slurm
 ```
 
 ---
