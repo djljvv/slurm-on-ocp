@@ -6,7 +6,7 @@ to validate multi-node coordination and stress-test resource limits.
 
 Launch methods:
   1. Auto-launch:  python ddp_test.py --launch
-                   (discovers cluster, scales nodes, submits, monitors — zero config)
+                   (discovers cluster, submits job, monitors — autoscaler handles scaling)
   2. Via Slurm:    sbatch ... ddp_test.py --intensity medium
   3. Via torchrun: torchrun --nnodes=N --nproc_per_node=1 ddp_test.py
   4. Single-node:  python ddp_test.py (auto-detects single GPU or CPU)
@@ -16,8 +16,6 @@ Intensity levels (--intensity):
   medium  - ResNet-18, 224x224, pre-loaded dataset (~1-2GB host RAM)
   heavy   - ResNet-18, 224x224, large dataset + workers (~3-6GB host RAM)
 
-Autoscaling mode (--autoscale):
-  Enables resource utilization monitoring and scaling efficiency metrics.
 """
 
 import os
@@ -28,7 +26,6 @@ import math
 import argparse
 import subprocess
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
@@ -470,110 +467,6 @@ def train(rank, world_size, device, args):
     return model, train_elapsed, epoch_throughputs
 
 
-# ---------------------------------------------------------------------------
-# Autoscale report
-# ---------------------------------------------------------------------------
-
-def collect_resource_utilization(rank, world_size, device):
-    stats = {"rank": rank, "device": str(device), "cpu_count": os.cpu_count()}
-
-    if torch.cuda.is_available() and device.type == "cuda":
-        stats["gpu_name"] = torch.cuda.get_device_name(device)
-        stats["gpu_memory_total_gb"] = round(torch.cuda.get_device_properties(device).total_memory / 1e9, 2)
-        stats["gpu_memory_allocated_gb"] = round(torch.cuda.memory_allocated(device) / 1e9, 2)
-        stats["gpu_memory_reserved_gb"] = round(torch.cuda.memory_reserved(device) / 1e9, 2)
-        stats["gpu_utilization_pct"] = round(
-            torch.cuda.memory_allocated(device) / torch.cuda.get_device_properties(device).total_memory * 100, 1
-        )
-
-    try:
-        with open("/proc/meminfo") as f:
-            meminfo = f.read()
-        for line in meminfo.splitlines():
-            if line.startswith("MemTotal:"):
-                stats["mem_total_gb"] = round(int(line.split()[1]) / 1e6, 2)
-            elif line.startswith("MemAvailable:"):
-                stats["mem_available_gb"] = round(int(line.split()[1]) / 1e6, 2)
-    except (FileNotFoundError, PermissionError):
-        pass
-
-    stats["process_rss_mb"] = round(get_host_memory_mb(), 1)
-    return stats
-
-
-def print_autoscale_report(rank, world_size, device, epoch_throughputs, train_elapsed):
-    if rank != 0:
-        return
-
-    avg_throughput = sum(epoch_throughputs) / len(epoch_throughputs) if epoch_throughputs else 0
-    global_throughput = avg_throughput * world_size
-
-    # Scaling efficiency: compare later epochs (steady state) to first epoch.
-    # First epoch includes DDP bucket rebuilding overhead, so steady-state
-    # throughput relative to first epoch shows how well distributed comms amortize.
-    # For true multi-node scaling efficiency you'd need a single-node baseline.
-    if len(epoch_throughputs) >= 2:
-        steady_state = sum(epoch_throughputs[1:]) / len(epoch_throughputs[1:])
-        first_epoch = epoch_throughputs[0]
-        comm_efficiency = (steady_state / first_epoch * 100) if first_epoch > 0 else 100
-    else:
-        comm_efficiency = 100.0
-
-    print(f"\n{'='*60}", flush=True)
-    print(f"  Autoscaling Report", flush=True)
-    print(f"{'='*60}", flush=True)
-    print(f"  Current world size:     {world_size}", flush=True)
-    print(f"  Per-rank throughput:    {avg_throughput:.0f} samples/s", flush=True)
-    print(f"  Global throughput:      {global_throughput:.0f} samples/s", flush=True)
-    print(f"  Communication overhead: {100 - comm_efficiency:.1f}% (first epoch vs steady state)", flush=True)
-
-    slurm_job_id = os.environ.get("SLURM_JOB_ID", "N/A")
-    slurm_nnodes = os.environ.get("SLURM_NNODES", "N/A")
-    slurm_job_num_nodes = os.environ.get("SLURM_JOB_NUM_NODES", slurm_nnodes)
-    print(f"  Slurm job:              {slurm_job_id}", flush=True)
-    print(f"  Allocated nodes:        {slurm_job_num_nodes}", flush=True)
-
-    # Recommendations based on throughput trend and world size
-    if world_size == 1:
-        recommendation = "SCALE UP  - Single node; adding workers will parallelize data loading"
-    elif comm_efficiency > 95:
-        recommendation = "SCALE UP  - Minimal communication overhead, more nodes would help"
-    elif comm_efficiency > 80:
-        recommendation = "HOLD      - Moderate overhead, current node count is reasonable"
-    else:
-        recommendation = "SCALE DOWN - High communication overhead, fewer nodes may be faster"
-
-    print(f"  Recommendation:         {recommendation}", flush=True)
-
-    resource_stats = collect_resource_utilization(rank, world_size, device)
-    if "gpu_utilization_pct" in resource_stats:
-        gpu_util = resource_stats["gpu_utilization_pct"]
-        print(f"  GPU memory utilization: {gpu_util:.1f}%", flush=True)
-    if "mem_available_gb" in resource_stats and "mem_total_gb" in resource_stats:
-        mem_used_pct = (1 - resource_stats["mem_available_gb"] / resource_stats["mem_total_gb"]) * 100
-        print(f"  Host memory usage:      {mem_used_pct:.1f}%", flush=True)
-
-    print(f"  Process RSS:            {resource_stats.get('process_rss_mb', 0):.0f} MB", flush=True)
-    print(f"{'='*60}\n", flush=True)
-
-    metrics_path = os.environ.get("AUTOSCALE_METRICS_PATH", "/tmp/ddp-autoscale-metrics.json")
-    metrics = {
-        "job_id": slurm_job_id,
-        "world_size": world_size,
-        "avg_throughput_per_rank": round(avg_throughput, 2),
-        "global_throughput": round(global_throughput, 2),
-        "comm_efficiency_pct": round(comm_efficiency, 2),
-        "train_elapsed_s": round(train_elapsed, 2),
-        "recommendation": recommendation.split(" - ")[0].strip(),
-        "resource_stats": resource_stats,
-    }
-    try:
-        with open(metrics_path, "w") as f:
-            json.dump(metrics, f, indent=2)
-        print(f"[Autoscale] Metrics written to {metrics_path}", flush=True)
-    except (PermissionError, OSError) as e:
-        print(f"[Autoscale] Could not write metrics: {e}", flush=True)
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -751,198 +644,43 @@ def calculate_plan(cluster_info, intensity_override=None, num_samples_override=N
     }
 
 
-def ensure_capacity(cluster_info, plan):
-    """Scale the NodeSet up if the plan requires more nodes than currently available."""
+def copy_script_to_cluster(cluster_info):
+    """Copy ddp_test.py to the controller and all currently running workers.
+
+    This is a dev-convenience step, not the source of truth: the NodeSet
+    mounts ddp_test.py from the 'slurm-worker-scripts' ConfigMap directly
+    onto every worker (see configs/slurm-cluster.yaml), including ones the
+    autoscaler creates later, so autoscaled nodes always have a copy without
+    needing this function to run. This just pushes local edits to nodes that
+    are already running, for faster iteration. If the copy target is
+    read-only (the ConfigMap mount), the per-pod copy is skipped silently —
+    the mounted version is already correct in that case.
+    """
     oc = cluster_info["oc"]
     namespace = cluster_info["namespace"]
     nodeset = cluster_info["nodeset"]
-    current = cluster_info["current_replicas"]
-    needed = plan["min_nodes"]
-
-    if current >= needed:
-        _log(f"Cluster has {current} replicas, need {needed} — no scaling required")
-        return
-
-    _log(f"Scaling NodeSet: {current} -> {needed} replicas")
-    _run([oc, "scale", "nodeset", nodeset, "-n", namespace, f"--replicas={needed}"])
-
-    _log("Waiting for pods to be Ready...")
-    deadline = time.time() + 300
-    while time.time() < deadline:
-        workers_raw = _run([
-            oc, "get", "pods", "-n", namespace,
-            "-l", f"nodeset.slinky.slurm.net/name={nodeset}",
-            "--field-selector=status.phase=Running",
-            "-o", "jsonpath={.items[*].metadata.name}"
-        ])
-        ready_pods = workers_raw.split() if workers_raw else []
-        if len(ready_pods) >= needed:
-            cluster_info["workers"] = ready_pods
-            _log(f"All {needed} pods are Running")
-            break
-        _log(f"  {len(ready_pods)}/{needed} pods ready, waiting...")
-        time.sleep(10)
-    else:
-        raise LaunchError(f"Timed out waiting for {needed} pods to be Ready")
-
-    # Wait for new nodes to register with Slurm
-    _log("Waiting for nodes to register with Slurm...")
-    deadline = time.time() + 180
-    idle_nodes = []
-    while time.time() < deadline:
-        try:
-            sinfo_out = _run([
-                oc, "exec", "-n", namespace, cluster_info["controller"],
-                "-c", "slurmctld", "--", "sinfo", "-h", "-N", "-o", "%N %T"
-            ], check=False)
-            idle_nodes = [
-                line.split()[0] for line in sinfo_out.splitlines()
-                if line.strip() and any(s in line for s in ("idle", "mix"))
-            ]
-            idle_nodes = list(set(idle_nodes))
-            if len(idle_nodes) >= needed:
-                _log(f"  {len(idle_nodes)} Slurm nodes ready: {', '.join(sorted(idle_nodes))}")
-                return
-        except LaunchError:
-            pass
-        _log(f"  {len(idle_nodes)}/{needed} Slurm nodes registered, waiting...")
-        time.sleep(10)
-
-    raise LaunchError(f"Timed out waiting for {needed} nodes to register with Slurm")
-
-
-def _provision_single_worker(pod, oc, namespace, script_path, pytorch_index):
-    """Provision a single worker pod with PyTorch and the training script.
-    Designed to run in a thread pool for parallel provisioning."""
-    # Check if already provisioned and working
-    ret = subprocess.run(
-        [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
-         "python3", "-c", "import torch; print(torch.__version__)"],
-        capture_output=True, text=True,
-    )
-    if ret.returncode == 0:
-        _log(f"  {pod}: PyTorch verified ({ret.stdout.strip()}), copying script...")
-    else:
-        _log(f"  {pod}: Installing pip + PyTorch (this takes a few minutes)...")
-
-        # Install pip — retry until it works
-        for attempt in range(3):
-            pip_ret = subprocess.run(
-                [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
-                 "bash", "-c", "apt-get update -qq && apt-get install -y -qq python3-pip"],
-                capture_output=True, text=True,
-            )
-            if pip_ret.returncode == 0:
-                break
-            _log(f"  {pod}: pip install attempt {attempt+1} failed, retrying in 15s...")
-            time.sleep(15)
-        else:
-            raise LaunchError(f"Failed to install pip on {pod}: {pip_ret.stderr.strip()}")
-
-        # Install PyTorch — this is the slow step
-        _log(f"  {pod}: Installing PyTorch (this is the slow part)...")
-        torch_ret = subprocess.run(
-            [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
-             "pip3", "install", "--break-system-packages", "torch",
-             "--index-url", pytorch_index],
-            capture_output=True, text=True,
-        )
-        if torch_ret.returncode != 0:
-            _log(f"  {pod}: First torch install failed, retrying...")
-            torch_ret = subprocess.run(
-                [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
-                 "pip3", "install", "--break-system-packages", "--force-reinstall",
-                 "torch", "--index-url", pytorch_index],
-                capture_output=True, text=True,
-            )
-            if torch_ret.returncode != 0:
-                raise LaunchError(
-                    f"PyTorch installation failed on {pod}: {torch_ret.stderr[-500:]}"
-                )
-
-        # Verify installation succeeded
-        _log(f"  {pod}: Verifying PyTorch import...")
-        verify = subprocess.run(
-            [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
-             "python3", "-c", "import torch; print(torch.__version__)"],
-            capture_output=True, text=True,
-        )
-        if verify.returncode != 0:
-            _log(f"  {pod}: WARNING — PyTorch import failed, retrying install...")
-            subprocess.run(
-                [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
-                 "pip3", "install", "--break-system-packages", "--force-reinstall",
-                 "torch", "--index-url", pytorch_index],
-                capture_output=True, text=True,
-            )
-            verify2 = subprocess.run(
-                [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
-                 "python3", "-c", "import torch; print(torch.__version__)"],
-                capture_output=True, text=True,
-            )
-            if verify2.returncode != 0:
-                raise LaunchError(
-                    f"PyTorch installation failed on {pod}: {verify2.stderr.strip()}"
-                )
-            verify = verify2
-        _log(f"  {pod}: PyTorch ready ({verify.stdout.strip()})")
-
-    # Copy training script
-    _run([oc, "cp", script_path, f"{namespace}/{pod}:/tmp/ddp_test.py", "-c", "slurmd"])
-    return pod
-
-
-def provision_workers(cluster_info, plan, pytorch_index="https://download.pytorch.org/whl/cu124"):
-    """Install PyTorch and copy ddp_test.py to all workers + controller.
-    Workers are provisioned in parallel to minimize wait time."""
-    oc = cluster_info["oc"]
-    namespace = cluster_info["namespace"]
     controller = cluster_info["controller"]
-    workers = cluster_info["workers"]
-    if workers is None or len(workers) == 0:
-        _log("No workers found, skipping provisioning")
-        return
     script_path = str(Path(__file__).resolve())
 
-    _log(f"Provisioning {len(workers)} worker(s) in parallel...")
+    workers_raw = _run([
+        oc, "get", "pods", "-n", namespace,
+        "-l", f"nodeset.slinky.slurm.net/name={nodeset}",
+        "--field-selector=status.phase=Running",
+        "-o", "jsonpath={.items[*].metadata.name}"
+    ])
+    workers = workers_raw.split() if workers_raw else []
+    cluster_info["workers"] = workers
 
-    # Provision all workers concurrently
-    errors = []
-    with ThreadPoolExecutor(max_workers=len(workers)) as executor:
-        futures = {
-            executor.submit(_provision_single_worker, pod, oc, namespace, script_path, pytorch_index): pod
-            for pod in workers
-        }
-        for future in as_completed(futures):
-            pod = futures[future]
-            try:
-                future.result()
-            except Exception as e:
-                errors.append(f"{pod}: {e}")
-
-    if errors:
-        raise LaunchError(f"Provisioning failed:\n  " + "\n  ".join(errors))
-
-    # Final readiness gate: confirm ALL workers can import torch
-    _log("Verifying all workers are ready...")
-    for pod in workers:
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            ret = subprocess.run(
-                [oc, "exec", "-n", namespace, pod, "-c", "slurmd", "--",
-                 "python3", "-c", "import torch"],
-                capture_output=True,
-            )
-            if ret.returncode == 0:
-                break
-            _log(f"  {pod}: waiting for PyTorch to be ready...")
-            time.sleep(10)
-        else:
-            raise LaunchError(f"{pod} failed readiness check — PyTorch not importable after 120s")
-
-    # Copy to controller so users can re-submit manually via sbatch
     _run([oc, "cp", script_path, f"{namespace}/{controller}:/tmp/ddp_test.py", "-c", "slurmctld"])
-    _log("All workers verified and ready")
+    copied = 0
+    for pod in workers:
+        try:
+            _run([oc, "cp", script_path, f"{namespace}/{pod}:/tmp/ddp_test.py", "-c", "slurmd"])
+            copied += 1
+        except LaunchError:
+            _log(f"  WARNING: failed to copy script to {pod}")
+
+    _log(f"Copied training script to controller + {copied} worker(s)")
 
 
 def submit_job(cluster_info, plan):
@@ -960,32 +698,36 @@ def submit_job(cluster_info, plan):
 
     batch_script = (
         "#!/bin/bash\n"
-        f"#SBATCH --job-name=ddp-autoscale\n"
+        f"#SBATCH --job-name=ddp-test\n"
         f"#SBATCH --nodes={min_nodes}-{max_nodes}\n"
         "#SBATCH --ntasks-per-node=1\n"
         "#SBATCH --cpus-per-task=2\n"
         "#SBATCH --time=00:30:00\n"
-        "#SBATCH --output=/tmp/ddp-autoscale-%j.out\n"
-        "#SBATCH --error=/tmp/ddp-autoscale-%j.err\n"
+        "#SBATCH --output=/tmp/ddp-test-%j.out\n"
+        "#SBATCH --error=/tmp/ddp-test-%j.err\n"
         "#SBATCH --export=ALL\n"
         "\n"
         "export MASTER_ADDR=$(scontrol show hostname $SLURM_NODELIST | head -n1)\n"
         "export MASTER_PORT=29500\n"
         "export WORLD_SIZE=$SLURM_NTASKS\n"
+        # PyTorch is installed into a shared emptyDir by the NodeSet's init
+        # container (see configs/slurm-cluster.yaml), not into the default
+        # site-packages, so it needs PYTHONPATH set explicitly here — srun
+        # tasks don't inherit the worker pod's own container env vars.
+        "export PYTHONPATH=/opt/pydeps\n"
         "\n"
         f"srun python3 /tmp/ddp_test.py \\\n"
         f"    --intensity {intensity} \\\n"
         f"    --epochs {epochs} \\\n"
         f"    --batch-size {batch_size} \\\n"
         f"    --num-samples {num_samples} \\\n"
-        f"    --autoscale \\\n"
         f"    --output-dir /tmp/ddp-results\n"
     )
 
     # Write batch script via stdin pipe to avoid shell escaping issues
     write_proc = subprocess.run(
         [oc, "exec", "-n", namespace, controller, "-c", "slurmctld", "-i", "--",
-         "tee", "/tmp/ddp-autoscale-batch.sh"],
+         "tee", "/tmp/ddp-test-batch.sh"],
         input=batch_script, capture_output=True, text=True,
     )
     if write_proc.returncode != 0:
@@ -993,7 +735,7 @@ def submit_job(cluster_info, plan):
 
     output = _run([
         oc, "exec", "-n", namespace, controller, "-c", "slurmctld", "--",
-        "sbatch", "/tmp/ddp-autoscale-batch.sh"
+        "sbatch", "/tmp/ddp-test-batch.sh"
     ])
 
     for word in output.split():
@@ -1072,7 +814,7 @@ def retrieve_results(cluster_info, job_id):
     try:
         content = _run([
             oc, "exec", "-n", namespace, batch_pod, "-c", "slurmd", "--",
-            "cat", f"/tmp/ddp-autoscale-{job_id}.out"
+            "cat", f"/tmp/ddp-test-{job_id}.out"
         ], check=False)
         if content:
             out_file.write_text(content)
@@ -1085,7 +827,7 @@ def retrieve_results(cluster_info, job_id):
     try:
         content = _run([
             oc, "exec", "-n", namespace, batch_pod, "-c", "slurmd", "--",
-            "cat", f"/tmp/ddp-autoscale-{job_id}.err"
+            "cat", f"/tmp/ddp-test-{job_id}.err"
         ], check=False)
         if content:
             err_file.write_text(content)
@@ -1116,8 +858,7 @@ def retrieve_results(cluster_info, job_id):
 
         for line in text.splitlines():
             if any(k in line for k in ("Training Complete", "Total time",
-                                        "Avg throughput", "Communication overhead",
-                                        "Recommendation")):
+                                        "Avg throughput")):
                 print(f"  {line.strip()}")
 
     _log(f"Results saved to: {results_dir}/")
@@ -1130,9 +871,9 @@ def _log(msg):
 
 def launch_main():
     """
-    Orchestration entry point — discovers the cluster, calculates resource
-    requirements, scales nodes, provisions workers, submits the training job,
-    and retrieves results. No inputs required.
+    Orchestration entry point — discovers the cluster, calculates workload
+    parameters, submits a Slurm job, and retrieves results. Cluster scaling is
+    handled by the in-cluster autoscaler watching squeue.
     """
     parser = argparse.ArgumentParser(
         description="Auto-launch DDP training on Slurm/OCP (zero-config)",
@@ -1152,15 +893,7 @@ def launch_main():
                         help="Override auto-detected dataset size")
     parser.add_argument("--max-nodes", type=int, default=None,
                         help="Override maximum node count")
-    parser.add_argument("--pytorch-index", default=None,
-                        help="PyTorch package index URL (default: env PYTORCH_INDEX or cu124)")
     args = parser.parse_args()
-
-    pytorch_index = (
-        args.pytorch_index
-        or os.environ.get("PYTORCH_INDEX")
-        or "https://download.pytorch.org/whl/cu124"
-    )
 
     print(flush=True)
     print("=" * 60, flush=True)
@@ -1197,18 +930,15 @@ def launch_main():
     _log(f"  Epochs:          {plan['epochs']}")
     print(flush=True)
 
-    # Phase 3: Scale cluster
-    _log("Ensuring cluster capacity...")
-    ensure_capacity(cluster_info, plan)
+    # Phase 3: Push local script edits to already-running nodes (dev
+    # convenience only — new nodes get the script from the ConfigMap mount
+    # baked into the NodeSet, see configs/slurm-cluster.yaml)
+    _log("Copying training script to cluster...")
+    copy_script_to_cluster(cluster_info)
     print(flush=True)
 
-    # Phase 4: Provision workers
-    _log("Provisioning workers...")
-    provision_workers(cluster_info, plan, pytorch_index=pytorch_index)
-    print(flush=True)
-
-    # Phase 5: Submit job
-    _log("Submitting training job...")
+    # Phase 4: Submit job (autoscaler scales up while job is pending)
+    _log("Submitting training job (autoscaler will scale cluster as needed)...")
     job_id = submit_job(cluster_info, plan)
     print(flush=True)
 
@@ -1348,8 +1078,6 @@ Intensity levels control memory pressure on the pod:
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch size per rank")
     parser.add_argument("--num-samples", type=int, default=None, help="Override dataset size")
     parser.add_argument("--num-workers", type=int, default=None, help="Override DataLoader workers")
-    parser.add_argument("--autoscale", action="store_true",
-                        help="Enable resource monitoring and scaling efficiency report")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Directory to save results (model checkpoint, metrics, predictions). "
                              "Defaults to results/ relative to the repo root.")
@@ -1379,29 +1107,17 @@ Intensity levels control memory pressure on the pod:
         print(f"\n{'#'*60}", flush=True)
         print(f"  Slurm on OCP - Distributed Training Test", flush=True)
         print(f"  Intensity: {args.intensity.upper()}", flush=True)
-        if args.autoscale:
-            print(f"  [Autoscaling mode enabled]", flush=True)
         print(f"{'#'*60}", flush=True)
         print(f"  Rank {rank}/{world_size} on {device}", flush=True)
         if "SLURM_JOB_ID" in os.environ:
             print(f"  Slurm Job ID: {os.environ['SLURM_JOB_ID']}", flush=True)
             print(f"  Slurm Nodes:  {os.environ.get('SLURM_NODELIST', 'N/A')}", flush=True)
-            if args.autoscale:
-                print(f"  Allocated:    {os.environ.get('SLURM_NNODES', '?')} nodes", flush=True)
         print(f"  CUDA available: {torch.cuda.is_available()}", flush=True)
         if torch.cuda.is_available():
             print(f"  GPU: {torch.cuda.get_device_name(device)}", flush=True)
             print(f"  GPU Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.1f} GB", flush=True)
         rss = get_host_memory_mb()
         print(f"  Host RSS (pre-load): {rss:.0f} MB", flush=True)
-        print(flush=True)
-
-    if args.autoscale and rank == 0:
-        stats = collect_resource_utilization(rank, world_size, device)
-        print(f"[Autoscale] Initial resource snapshot:", flush=True)
-        for k, v in stats.items():
-            if k != "rank":
-                print(f"  {k}: {v}", flush=True)
         print(flush=True)
 
     # Phase 1: Communication test
@@ -1424,10 +1140,6 @@ Intensity levels control memory pressure on the pod:
     # Phase 4: Save results
     with timer("Saving Results", rank):
         save_results(model, device, args, rank, world_size, train_elapsed, epoch_throughputs, args.output_dir)
-
-    # Phase 5: Autoscaling report
-    if args.autoscale:
-        print_autoscale_report(rank, world_size, device, epoch_throughputs, train_elapsed)
 
     # Final summary
     if rank == 0:

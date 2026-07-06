@@ -43,10 +43,28 @@ spec:
   logfile:
     image: 'docker.io/library/alpine:latest'
     resources: {}
+  # gres.conf declares the GPU via a static device File= mapping (this
+  # slurmd image has no NVML plugin compiled in, so AutoDetect=nvml always
+  # reports 0 GPUs regardless of the driver being present).
+  configFileRefs:
+    - name: slurm-gres-conf
+  # NOTE: GresTypes=gpu is intentionally NOT set here — the operator's base
+  # template already declares it, and repeating it here caused Slurm's GRES
+  # accounting to double up ("GresTypes 1 specified more than once").
+  #
+  # NOTE: no static `NodeName=slinky-[0-7] Gres=gpu:1` line here on purpose.
+  # Workers run `slurmd -Z` (dynamic node registration) — combining that with
+  # a static, pre-declared NodeName range for the same hostnames causes
+  # slurmd to log "Duplicated NodeHostName" on every boot and register as
+  # DOWN+INVALID_REG ("gres/gpu count reported lower than configured"),
+  # because the static declaration's implicit Gres expectation conflicts
+  # with the node's own dynamic self-registration. With `-Z`, each node
+  # reports its own CPUs/memory/GRES (from gres.conf) at registration time,
+  # so a static NodeName/Gres declaration for the same nodes isn't needed
+  # and isn't safe to combine.
   extraConf: |
     PartitionName=all Nodes=ALL Default=YES MaxTime=UNLIMITED State=UP
     MinJobAge=3600
-    GresTypes=gpu
 ---
 # NodeSet (Compute Nodes) - Note: requires controllerRef
 # IMPORTANT: Include image field - operator may not set it automatically
@@ -83,9 +101,19 @@ spec:
         value: '0'
       - name: POD_MEMORY
         value: '0'
+      # Lets the pre-installed torch (installed by the init container below into
+      # a shared emptyDir, since init/main containers don't share a filesystem)
+      # be importable by slurmd's python3 without a separate provisioning step.
+      - name: PYTHONPATH
+        value: '/opt/pydeps'
     volumeMounts:
       - name: dshm
         mountPath: /dev/shm
+      - name: pydeps
+        mountPath: /opt/pydeps
+      - name: worker-scripts
+        mountPath: /tmp/ddp_test.py
+        subPath: ddp_test.py
   logfile:
     image: 'docker.io/library/alpine:latest'
     resources: {}
@@ -96,6 +124,7 @@ spec:
         app.kubernetes.io/version: '25.11'
         nodeset.slinky.slurm.net/name: slurm-worker-slinky
     spec:
+      serviceAccountName: slurm-workload
       affinity:
         nodeAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -107,7 +136,44 @@ spec:
                     values: ["true"]
       hostname: slinky-
       imagePullSecrets: null
-      initContainers: []
+      # Runs BEFORE slurmd starts, so slurmd (and therefore the Slurm
+      # controller) never sees this node as available until PyTorch is
+      # actually importable. This is what makes autoscaling safe for any
+      # job: a freshly scaled-up node cannot be scheduled onto while it is
+      # still provisioning, and Kubernetes runs one of these per pod, so
+      # scaling up by several nodes at once provisions them all in parallel
+      # instead of one at a time.
+      initContainers:
+        - name: provision-pytorch
+          image: 'ghcr.io/slinkyproject/slurmd:25.11-ubuntu24.04'
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              if [ -f /opt/pydeps/.installed ]; then
+                echo "PyTorch already present in shared volume, skipping install"
+                exit 0
+              fi
+              echo "Installing PyTorch into /opt/pydeps..."
+              apt-get update -qq
+              apt-get install -y -qq python3-pip
+              pip3 install --break-system-packages --target=/opt/pydeps \
+                torch --index-url "${PYTORCH_INDEX}"
+              touch /opt/pydeps/.installed
+              echo "PyTorch install complete"
+          env:
+            - name: PYTORCH_INDEX
+              value: 'https://download.pytorch.org/whl/cu124'
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          volumeMounts:
+            - name: pydeps
+              mountPath: /opt/pydeps
       nodeSelector:
         kubernetes.io/os: linux
       priorityClassName: null
@@ -130,6 +196,17 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 2Gi
+        # Shared between the init container and slurmd so packages installed
+        # before slurmd starts are importable at runtime (init and main
+        # containers do not otherwise share a filesystem).
+        - name: pydeps
+          emptyDir: {}
+        # Training script(s), baked in at deploy time (see deploy-slurm.sh)
+        # so every worker — including ones created by the autoscaler — has
+        # them immediately, with no runtime copy step required.
+        - name: worker-scripts
+          configMap:
+            name: slurm-worker-scripts
   updateStrategy:
     rollingUpdate:
       maxUnavailable: 100%

@@ -1,17 +1,21 @@
-# Slurm NodeSet Autoscaler — Scale-Down Watchdog + Worker Provisioner
+# Slurm NodeSet Autoscaler — Queue-Driven Scale-Up/Down
 #
-# Monitors idle workers and scales the NodeSet back to MIN_REPLICAS when
-# no jobs are running. Also provisions PyTorch on newly scaled-up workers.
+# Monitors Slurm queue demand and scales the NodeSet to match pending/running
+# job node requirements. Scales back to MIN_REPLICAS after idle periods.
+#
+# Provisioning (PyTorch + training scripts) is handled per-pod by an init
+# container on the NodeSet itself (see configs/slurm-cluster.yaml) — a node
+# never registers with slurmctld until it's ready, so this autoscaler only
+# needs to size the NodeSet; it doesn't need to touch worker pods directly.
 #
 # How it works:
 #   1. Every POLL_INTERVAL seconds, exec into slurmctld and run `squeue`
-#   2. If no pending/running jobs for SCALE_DOWN_DELAY seconds, scale down
-#   3. After any scale-up (triggered externally by `ddp_test.py --launch`),
-#      detect new pods and provision them with PyTorch + training scripts
+#   2. Scale UP when pending/running jobs need more nodes than are available
+#   3. If no pending/running jobs for SCALE_DOWN_DELAY seconds, scale down
 #   4. The Slinky operator handles pod lifecycle (drain before scale-in)
 #
 # Scaling behavior:
-#   Scale-UP:   Handled by `python demos/ddp_test.py --launch` (not this watchdog)
+#   Scale-UP:   Pending/running jobs request more nodes than current replicas
 #   Scale-DOWN: No jobs for SCALE_DOWN_DELAY seconds → scale toward MIN_REPLICAS
 #   Never scales below MIN_REPLICAS or above MAX_REPLICAS
 #
@@ -23,10 +27,9 @@
 #   ./scripts/deploy-autoscale.sh
 #
 # Deploy (manual alternative):
-#   1. Create the ConfigMap from script files:
+#   1. Create the ConfigMap from the script file:
 #      oc create configmap slurm-autoscaler-script -n slurm \
 #        --from-file=autoscaler.sh=scripts/autoscaler-loop.sh \
-#        --from-file=ddp_test.py=demos/ddp_test.py \
 #        --dry-run=client -o yaml | oc apply -f -
 #
 #   2. Apply RBAC + Deployment:
@@ -112,8 +115,6 @@ spec:
               value: "30"
             - name: SCALE_DOWN_DELAY
               value: "300"
-            - name: PYTORCH_INDEX
-              value: "https://download.pytorch.org/whl/cu124"
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false

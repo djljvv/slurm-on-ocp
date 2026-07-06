@@ -169,15 +169,21 @@ If operator is installed via Software Catalog/OperatorHub, use Option B (Direct 
 
 This will:
 - Detect existing CRDs and operator (skip installation)
-- Deploy cluster using direct YAML (works with OperatorHub)
-- Deploy the autoscaler (provisions workers with PyTorch automatically)
+- Create the `slurm-workload` service account and grant it the `anyuid` SCC (bootstraps `default` too, then narrows to whichever SA the operator actually assigns to the controller)
+- Create the `slurm-worker-scripts` ConfigMap (mounts `demos/ddp_test.py` onto every worker pod) and `slurm-gres-conf` ConfigMap (static GPU device mapping so `slurmd` can report its GPU at dynamic registration time)
+- Deploy cluster using direct YAML (works with OperatorHub) — each worker runs an init container that installs PyTorch **before** `slurmd` starts, so a node can never be scheduled onto until it's actually ready (see Step 5 troubleshooting for what this looks like)
+- Deploy the autoscaler (scales workers up/down automatically based on Slurm queue demand — pending/running jobs that need more nodes trigger scale-up; idle workers scale back down after 5 minutes)
 - Handle all setup automatically
 
 #### Option B: Using Direct YAML (Works with OperatorHub)
 
+**Note:** `configs/slurm-cluster.yaml` runs worker pods under the `slurm-workload` service account and mounts two ConfigMaps (`slurm-worker-scripts`, `slurm-gres-conf`). If you skip creating them, worker pods will fail to start (`serviceaccount "slurm-workload" not found` or `configmap "..." not found`). `./scripts/deploy-slurm.sh` (Option A) creates all of this for you automatically — the steps below just show what it does manually.
+
 ```bash
-# 1. Create namespace and configure security
+# 1. Create namespace, service account, and configure security
 oc create namespace slurm 2>/dev/null || true
+oc create serviceaccount slurm-workload -n slurm 2>/dev/null || true
+oc adm policy add-scc-to-user anyuid -z slurm-workload -n slurm
 oc adm policy add-scc-to-user anyuid -z default -n slurm
 
 # 2. Create secrets (operator default names/keys so UI template works without editing refs)
@@ -190,7 +196,19 @@ oc create secret generic slurm-auth-slurm -n slurm \
   --from-literal=slurm.key="$SLURM_KEY" \
   --dry-run=client -o yaml | oc apply -f -
 
-# 3. Deploy using the config file (uses v1beta1 API)
+# 3. Create ConfigMaps required by configs/slurm-cluster.yaml
+#    - slurm-worker-scripts: mounts demos/ddp_test.py onto every worker pod
+#      (including ones the autoscaler creates later)
+#    - slurm-gres-conf: static gres.conf GPU device mapping. Needed because the
+#      slurmd image has no NVML plugin, so AutoDetect=nvml would always report 0 GPUs
+oc create configmap slurm-worker-scripts -n slurm \
+  --from-file=ddp_test.py=demos/ddp_test.py \
+  --dry-run=client -o yaml | oc apply -f -
+oc create configmap slurm-gres-conf -n slurm \
+  --from-literal=gres.conf="NodeName=slinky-[0-7] Name=gpu File=/dev/nvidia0" \
+  --dry-run=client -o yaml | oc apply -f -
+
+# 4. Deploy using the config file (uses v1beta1 API)
 oc apply -f configs/slurm-cluster.yaml
 ```
 
@@ -250,12 +268,14 @@ slurm-worker-slinky-1         2/2     Running   0          2m
 > **Note on READY counts:** The controller pod shows `3/3` because it has sidecar containers (slurmctld, reconfigure, logfile). Worker pods show `2/2` (slurmd + logfile sidecar). If you see `1/1`, you may be running a minimal configuration without sidecars — this is also fine.
 
 **Troubleshooting Step 5:**
-- **Pods stuck in `Pending`** — Check if the `anyuid` SCC was applied: `oc get pods -n slurm -o wide` and `oc describe pod <pod-name> -n slurm | grep -A5 Events`. If you see SCC-related errors, apply it: `oc adm policy add-scc-to-user anyuid -z default -n slurm`
+- **Pods stuck in `Pending`** — Check if the `anyuid` SCC was applied: `oc get pods -n slurm -o wide` and `oc describe pod <pod-name> -n slurm | grep -A5 Events`. If you see SCC-related errors, apply it: `oc adm policy add-scc-to-user anyuid -z default -n slurm`. Worker pods run as the `slurm-workload` service account (see `spec.template.spec.serviceAccountName` in `configs/slurm-cluster.yaml`), so also grant it there: `oc adm policy add-scc-to-user anyuid -z slurm-workload -n slurm`.
 - **Worker pods not appearing after SCC fix** — The operator may need a nudge to reconcile. Force it by annotating the NodeSet:
   ```bash
   oc annotate nodeset slurm-worker-slinky -n slurm reconcile=$(date +%s) --overwrite
   ```
 - **Pods in `Init:0/2` or `Init:CrashLoopBackOff`** — Init containers may be waiting for dependencies. Check init container logs: `oc logs <pod-name> -n slurm -c <init-container-name> --previous`
+- **Worker pods sitting in `Init:0/1` for 1-2 minutes** — This is expected, not a failure. Every worker pod runs a `provision-pytorch` init container that installs PyTorch via `pip3` into a per-pod `emptyDir` **before** `slurmd` starts — the node intentionally won't register with (and can't be scheduled onto by) the Slurm controller until this finishes. This runs fresh on every new pod (first deploy, or any time the autoscaler scales up new replicas) — it's not cached across pods. Watch progress with: `oc logs <worker-pod> -n slurm -c provision-pytorch -f`. Once it prints `PyTorch install complete`, the pod moves on to starting `slurmd`.
+- **`configmap "slurm-worker-scripts" not found` or `configmap "slurm-gres-conf" not found`** — These ConfigMaps are required by `configs/slurm-cluster.yaml` but aren't created by `oc apply` itself. Run `./scripts/deploy-slurm.sh` (which creates them automatically), or create them manually as shown in Step 4, Option B.
 
 ### Step 6: Test Slurm Cluster
 
@@ -611,6 +631,8 @@ EOF
 #### Step 3.4: Create NodeSet (FOURTH STEP - After Controller is Ready)
 
 **Important:** Resources in NodeSet go under `spec.slurmd.resources`, NOT directly under `spec.resources`.
+
+**Note on PyTorch/DDP demo:** The NodeSet YAML below is a minimal example for basic `sinfo`/`sbatch` testing — it does **not** include the `provision-pytorch` init container, GPU `gres.conf`, or worker-scripts ConfigMap that `configs/slurm-cluster.yaml` (used by Method 1 / `./scripts/deploy-slurm.sh`) sets up automatically. If you plan to run `python demos/ddp_test.py --launch` (see the [DDP Test Guide](DDP_TEST_GUIDE.md)), deploy via Method 1 instead (or apply `configs/slurm-cluster.yaml` directly) so workers come up with PyTorch already provisioned — there's no runtime fallback that installs it for you anymore.
 
 **Via Operator UI:**
 
@@ -1305,9 +1327,12 @@ oc logs -n slurm -l app.kubernetes.io/component=compute --tail=100
 ./scripts/cleanup-slurm.sh slurm
 
 # Or manually:
+oc delete -f configs/slurm-autoscaler.yaml --ignore-not-found
 oc delete controller,nodeset --all -n slurm
 oc delete statefulset,deployment,pods,svc,pvc --all -n slurm
+oc delete configmap --all -n slurm
 oc delete secret slurm-auth-jwths256 slurm-auth-slurm -n slurm
+oc adm policy remove-scc-from-user anyuid -z slurm-workload -n slurm
 oc adm policy remove-scc-from-user anyuid -z default -n slurm
 oc delete namespace slurm
 ```

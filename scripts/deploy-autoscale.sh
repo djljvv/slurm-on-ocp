@@ -2,11 +2,10 @@
 set -euo pipefail
 
 ###############################################################################
-# Slurm Autoscaler — Deploy the scale-down watchdog
+# Slurm Autoscaler — Deploy the queue-driven NodeSet autoscaler
 #
-# Deploys the background autoscaler loop that handles scale-DOWN after idle.
-# Scale-UP is now handled by `python ddp_test.py --launch` which proactively
-# sizes the cluster before job submission.
+# Deploys the background autoscaler loop that scales the cluster based on
+# Slurm queue demand (pending/running job node counts) and scales down after idle.
 #
 # Usage:
 #   ./scripts/deploy-autoscale.sh              # Deploy the autoscaler watchdog
@@ -50,12 +49,11 @@ if [ "$TEARDOWN" = true ]; then
   exit 0
 fi
 
-section "Deploying autoscaler (scale-down watchdog)"
+section "Deploying autoscaler (queue-driven scale-up/down)"
 
 log "Creating ConfigMap 'slurm-autoscaler-script'..."
 oc create configmap slurm-autoscaler-script -n "$NAMESPACE" \
   --from-file=autoscaler.sh="${SCRIPT_DIR}/autoscaler-loop.sh" \
-  --from-file=ddp_test.py="${REPO_ROOT}/demos/ddp_test.py" \
   --dry-run=client -o yaml | oc apply -f -
 
 log "Applying autoscaler RBAC and Deployment..."
@@ -63,10 +61,10 @@ oc apply -f "${REPO_ROOT}/configs/slurm-autoscaler.yaml"
 
 # The autoscaler pod itself runs as non-root with restricted capabilities.
 # However, OpenShift requires the exec caller's SA to hold an SCC that can
-# validate the target pod's security context. Since slurmd containers run
-# with privileged capabilities (SYS_ADMIN, NET_ADMIN, etc.), the autoscaler
-# SA needs the privileged SCC to be allowed to kubectl exec into them.
-log "Granting privileged SCC to autoscaler SA (required for exec into slurmd pods)..."
+# validate the target pod's security context. The controller (slurmctld)
+# container runs with elevated capabilities, so the autoscaler SA needs the
+# privileged SCC to be allowed to kubectl exec into it (to run squeue).
+log "Granting privileged SCC to autoscaler SA (required for exec into the controller pod)..."
 oc adm policy add-scc-to-user privileged -z slurm-autoscaler -n "$NAMESPACE" 2>/dev/null || true
 
 log "Waiting for autoscaler pod..."
@@ -80,9 +78,8 @@ while [ $waited -lt 30 ]; do
   waited=$((waited + 3))
 done
 
-log "Autoscaler watchdog deployed"
+log "Autoscaler deployed"
 echo ""
-echo "  The autoscaler now only handles scale-DOWN after idle periods."
-echo "  Scale-UP is handled automatically by:"
-echo "    python demos/ddp_test.py --launch"
+echo "  The autoscaler scales the NodeSet based on Slurm queue demand."
+echo "  Submit any sbatch job — pending jobs trigger scale-up automatically."
 echo ""

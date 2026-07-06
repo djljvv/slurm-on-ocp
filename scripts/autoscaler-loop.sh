@@ -1,14 +1,19 @@
 #!/bin/sh
 set -u
 
-# Slurm NodeSet Autoscaler — Scale-Down Watchdog
+# Slurm NodeSet Autoscaler — queue-driven scale-up + idle scale-down
 #
-# This loop runs in-cluster and handles:
-#   - Scaling DOWN after an idle period (no pending jobs)
-#   - Provisioning any newly-scaled workers with PyTorch
+# Scales the NodeSet to match Slurm queue demand. Works for any Slurm job —
+# scaling is driven purely by squeue node demand (%D), not by a specific
+# workload launcher.
 #
-# Scale-UP is handled proactively by `python ddp_test.py --launch`
-# which sizes the cluster BEFORE submitting jobs.
+# Provisioning (PyTorch + training scripts) is NOT handled here anymore.
+# It's handled at the pod level: the NodeSet's init container (see
+# configs/slurm-cluster.yaml) installs everything a worker needs BEFORE
+# slurmd starts, so a node never registers with the Slurm controller — and
+# therefore can never be scheduled onto — until it's actually ready. That
+# removes the race this loop used to work around, and lets Kubernetes
+# provision multiple new nodes in parallel instead of one at a time.
 
 NAMESPACE="${NAMESPACE:-slurm}"
 NODESET="${NODESET:-slurm-worker-slinky}"
@@ -17,7 +22,6 @@ MIN_REPLICAS="${MIN_REPLICAS:-2}"
 MAX_REPLICAS="${MAX_REPLICAS:-8}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
 SCALE_DOWN_DELAY="${SCALE_DOWN_DELAY:-300}"
-PYTORCH_INDEX="${PYTORCH_INDEX:-https://download.pytorch.org/whl/cu124}"
 
 LAST_PENDING_TIME=""
 
@@ -51,96 +55,17 @@ get_pending_info() {
     squeue -h -t PENDING -o "%i %D"
 }
 
-is_provisioned() {
-  kubectl exec -n "$NAMESPACE" "$1" -c slurmd -- \
-    test -f /tmp/.provisioning_done >/dev/null 2>&1
+get_running_info() {
+  kubectl exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -- \
+    squeue -h -t RUNNING -o "%i %D"
 }
 
-is_provisioning() {
-  kubectl exec -n "$NAMESPACE" "$1" -c slurmd -- \
-    test -f /tmp/.provisioning_in_progress >/dev/null 2>&1
-}
-
-provision_worker() {
-  local pod="$1"
-  log "PROVISION: installing dependencies on ${pod}..."
-
-  # Write sentinel so concurrent polls skip this pod
-  kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- \
-    touch /tmp/.provisioning_in_progress >/dev/null 2>&1 || true
-
-  if ! kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- \
-    bash -c "apt-get update -qq && apt-get install -y -qq python3-pip" >/dev/null 2>&1; then
-    log "PROVISION: WARNING: pip install failed on ${pod}"
-    kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- rm -f /tmp/.provisioning_in_progress >/dev/null 2>&1 || true
-    return 1
-  fi
-
-  log "PROVISION: installing PyTorch on ${pod}..."
-  if ! kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- \
-    pip3 install --break-system-packages torch --index-url "$PYTORCH_INDEX" >/dev/null 2>&1; then
-    log "PROVISION: WARNING: PyTorch install failed on ${pod}"
-    kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- rm -f /tmp/.provisioning_in_progress >/dev/null 2>&1 || true
-    return 1
-  fi
-
-  for script in ddp_test.py; do
-    if [ -f "/scripts/${script}" ]; then
-      kubectl cp "/scripts/${script}" "${NAMESPACE}/${pod}:/tmp/${script}" -c slurmd || {
-        log "PROVISION: WARNING: failed to copy ${script} to ${pod}"
-        kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- rm -f /tmp/.provisioning_in_progress >/dev/null 2>&1 || true
-        return 1
-      }
-    fi
-  done
-
-  # Mark done: swap in-progress for completed sentinel
-  kubectl exec -n "$NAMESPACE" "$pod" -c slurmd -- \
-    bash -c "rm -f /tmp/.provisioning_in_progress && touch /tmp/.provisioning_done" >/dev/null 2>&1
-  log "PROVISION: ${pod} ready"
-  return 0
-}
-
-provision_new_workers() {
-  local ready_pods
-  ready_pods=$(kubectl get pods -n "$NAMESPACE" \
-    -l "nodeset.slinky.slurm.net/name=${NODESET}" \
-    --field-selector=status.phase=Running \
-    -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
-
-  local pids=""
-  for pod in $ready_pods; do
-    local deleting
-    deleting=$(kubectl get pod "$pod" -n "$NAMESPACE" \
-      -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null)
-    if [ -n "$deleting" ]; then
-      continue
-    fi
-
-    if ! is_provisioned "$pod" && ! is_provisioning "$pod"; then
-      local ready_count
-      ready_count=$(kubectl get pod "$pod" -n "$NAMESPACE" \
-        -o jsonpath='{.status.containerStatuses[?(@.ready==true)].name} {.status.initContainerStatuses[?(@.ready==true)].name}' 2>/dev/null \
-        | tr ' ' '\n' | grep -c . 2>/dev/null)
-      ready_count="${ready_count:-0}"
-      if [ "$ready_count" -lt 2 ]; then
-        continue
-      fi
-      provision_worker "$pod" &
-      pids="$pids $!"
-    fi
-  done
-
-  # Wait for all provisioners, tolerating individual failures
-  local failed=0
-  for pid in $pids; do
-    wait "$pid" || failed=$((failed + 1))
-  done
-  [ "$failed" -eq 0 ] || log "WARNING: $failed worker(s) failed provisioning"
+max_job_nodes() {
+  printf '%s\n%s\n' "$1" "$2" | awk 'NF >= 2 { n = $2 + 0; if (n > m) m = n } END { print m + 0 }'
 }
 
 # ---- Main loop ----
-log "Slurm NodeSet Autoscaler (scale-down watchdog)"
+log "Slurm NodeSet Autoscaler (queue-driven scale-up + idle scale-down)"
 log "  NodeSet:       $NODESET"
 log "  Min replicas:  $MIN_REPLICAS"
 log "  Max replicas:  $MAX_REPLICAS"
@@ -152,13 +77,7 @@ discover_controller
 log "  Controller:    $CONTROLLER_POD"
 log ""
 
-log "Provisioning any existing workers..."
-provision_new_workers
-
-PREV_REPLICAS=""
-
 while true; do
-  # Re-discover controller each iteration in case it restarted
   discover_controller
 
   CURRENT=$(get_current_replicas 2>/dev/null || echo "")
@@ -168,15 +87,8 @@ while true; do
     continue
   fi
 
-  # Detect external scale-up (e.g. from --launch) and reset cooldown
-  if [ -n "$PREV_REPLICAS" ] && [ "$CURRENT" -gt "$PREV_REPLICAS" ]; then
-    log "EXTERNAL SCALE-UP detected: ${PREV_REPLICAS} -> ${CURRENT} (resetting cooldown)"
-    LAST_PENDING_TIME=""
-  fi
-  PREV_REPLICAS="$CURRENT"
+  NOW=$(date +%s)
 
-  # Query squeue — if kubectl exec fails, skip this iteration rather than
-  # assuming 0 jobs (which could trigger premature scale-down).
   if ! PENDING_OUTPUT=$(get_pending_info 2>/dev/null); then
     log "WARNING: failed to query pending jobs (controller unreachable?), skipping cycle"
     sleep "$POLL_INTERVAL"
@@ -184,23 +96,37 @@ while true; do
   fi
 
   PENDING_COUNT=0
-  RUNNING_COUNT=0
   if [ -n "$PENDING_OUTPUT" ]; then
     PENDING_COUNT=$(printf '%s' "$PENDING_OUTPUT" | grep -c '^' 2>/dev/null || echo 0)
   fi
 
-  # Also check for running jobs — don't scale down while jobs are active
-  if ! RUNNING_OUTPUT=$(kubectl exec -n "$NAMESPACE" "$CONTROLLER_POD" -c slurmctld -- \
-    squeue -h -t RUNNING -o "%i" 2>/dev/null); then
+  if ! RUNNING_OUTPUT=$(get_running_info 2>/dev/null); then
     log "WARNING: failed to query running jobs (controller unreachable?), skipping cycle"
     sleep "$POLL_INTERVAL"
     continue
   fi
+
+  RUNNING_COUNT=0
   if [ -n "$RUNNING_OUTPUT" ]; then
     RUNNING_COUNT=$(printf '%s' "$RUNNING_OUTPUT" | grep -c '^' 2>/dev/null || echo 0)
   fi
 
-  NOW=$(date +%s)
+  MAX_DEMAND=$(max_job_nodes "$PENDING_OUTPUT" "$RUNNING_OUTPUT")
+  if [ "$MAX_DEMAND" -gt 0 ]; then
+    NEEDED=$MAX_DEMAND
+    if [ "$NEEDED" -lt "$MIN_REPLICAS" ]; then
+      NEEDED=$MIN_REPLICAS
+    fi
+    if [ "$NEEDED" -gt "$MAX_REPLICAS" ]; then
+      log "WARNING: job demand ${NEEDED} nodes exceeds MAX_REPLICAS ${MAX_REPLICAS}, capping"
+      NEEDED=$MAX_REPLICAS
+    fi
+    if [ "$CURRENT" -lt "$NEEDED" ]; then
+      log "SCALE-UP: ${PENDING_COUNT} pending + ${RUNNING_COUNT} running need ${NEEDED} nodes (have ${CURRENT})"
+      scale_nodeset "$NEEDED"
+      CURRENT=$NEEDED
+    fi
+  fi
 
   if [ "$PENDING_COUNT" -gt 0 ] || [ "$RUNNING_COUNT" -gt 0 ]; then
     LAST_PENDING_TIME="$NOW"
@@ -209,7 +135,6 @@ while true; do
     else
       log "BUSY: ${RUNNING_COUNT} running job(s) (${CURRENT} replicas)"
     fi
-    provision_new_workers
   else
     if [ -n "$LAST_PENDING_TIME" ]; then
       IDLE_FOR=$((NOW - LAST_PENDING_TIME))
@@ -234,8 +159,6 @@ while true; do
         log "IDLE: no jobs (${CURRENT} replicas)"
       fi
     fi
-
-    provision_new_workers
   fi
 
   sleep "$POLL_INTERVAL"

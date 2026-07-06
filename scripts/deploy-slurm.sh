@@ -344,6 +344,29 @@ deploy_cluster_via_yaml() {
   oc adm policy add-scc-to-user anyuid -z slurm-workload -n "$NAMESPACE" 2>/dev/null || true
   oc adm policy add-scc-to-user anyuid -z default -n "$NAMESPACE" 2>/dev/null || true
   
+  # Create/update the ConfigMap holding worker training script(s). The NodeSet
+  # mounts this directly onto every worker pod (see configs/slurm-cluster.yaml),
+  # so newly autoscaled nodes always have the script — no runtime copy needed.
+  # Re-run this script (or just this step) after editing demos/ddp_test.py so
+  # future scale-ups pick up the change; already-running pods keep whatever
+  # was mounted at pod start until they're recreated.
+  log_info "Creating/updating ConfigMap 'slurm-worker-scripts'..."
+  oc create configmap slurm-worker-scripts -n "$NAMESPACE" \
+    --from-file=ddp_test.py="$REPO_ROOT/demos/ddp_test.py" \
+    --dry-run=client -o yaml | oc apply -f -
+
+  # Create/update gres.conf so slurmd can report its GPU at dynamic (-Z)
+  # registration time. Uses a static File= mapping rather than
+  # AutoDetect=nvml: the slurmd image (ghcr.io/slinkyproject/slurmd) isn't
+  # built with the NVML plugin, so AutoDetect=nvml always reports 0 GPUs on
+  # this image regardless of the driver being present. See the comment above
+  # `configFileRefs` in configs/slurm-cluster.yaml for why the old static
+  # NodeName=... Gres=gpu:1 line was removed instead of kept alongside this.
+  log_info "Creating/updating ConfigMap 'slurm-gres-conf'..."
+  oc create configmap slurm-gres-conf -n "$NAMESPACE" \
+    --from-literal=gres.conf="NodeName=slinky-[0-7] Name=gpu File=/dev/nvidia0" \
+    --dry-run=client -o yaml | oc apply -f -
+
   # Create secrets if they don't exist (operator default names/keys)
   if ! oc get secret slurm-auth-jwths256 -n "$NAMESPACE" &>/dev/null; then
     log_info "Creating slurm-auth-jwths256 and slurm-auth-slurm secrets..."
